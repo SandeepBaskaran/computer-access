@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment (contains secrets)
+.env
+
+# Logs
+*.log
+audit.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Configs
+permissions.json
+
+# IDE
+.vscode/
+.idea/
+.claude/
