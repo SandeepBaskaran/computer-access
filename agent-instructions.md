@@ -70,6 +70,40 @@ Full local machine access: filesystem, shell, git, media, documents, and network
 - `web-search` — Search the web
 - `port-check` — Check if a port is in use
 
+**Background Tasks** (`task-manage`)
+- `run` / `status` / `logs` / `cancel` / `list` — Run long shell jobs without blocking the connection
+
+**Filesystem Watcher** (`watch-manage`)
+- `watch` / `poll` / `unwatch` / `list-watchers` — Watch paths for changes
+- `tail-log` — Tail the last N lines of a log file
+
+**Keychain** (`secret-manage`) — *disabled unless `ENABLE_SECRETS=true`*
+- `get` / `set` / `delete` / `list` — macOS Keychain secrets
+
+**Archives** (`archive-manage`)
+- `zip` / `unzip` / `tar` / `untar` / `list-contents`
+
+**SQLite** (`db-manage`)
+- `query` / `execute` / `schema` / `list-tables`
+
+**Diff & Patch** (`diff-manage`)
+- `file-diff` / `dir-diff` / `apply-patch` / `three-way-merge`
+
+**Code Formatter** (`code-format`)
+- `format` / `check` / `list-formatters` — prettier, black, gofmt, rustfmt, etc.
+
+**Structured Tests** (`test-manage`)
+- `run` / `run-file` / `coverage` — jest, vitest, pytest, go, cargo
+
+**Audit Explorer** (`audit-manage`)
+- `tail` / `search` / `stats` / `session-history`
+
+**Env Files** (`env-manage`)
+- `read` / `set` / `unset` / `validate` / `diff` — masked `.env` management
+
+**Window Control** (`window-manage`)
+- `list` / `focus` / `resize` / `move` / `screenshot-window` / `applescript`
+
 ---
 
 ## 🗂️ Project Context

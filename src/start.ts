@@ -13,22 +13,23 @@
  */
 import ngrok from "@ngrok/ngrok";
 import { startServer } from "./server.js";
-import dotenv from "dotenv";
+import { PORT, MCP_TOKEN } from "./config.js";
 import path from "path";
-import { fileURLToPath } from "url";
 import fs from "fs/promises";
 import os from "os";
-
-// Resolve the __dirname context even when compiled to ES Modules
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Load .env explicitly from the project root
-dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 async function boot() {
   console.log("🚀 Starting Computer Access MCP...");
 
-  const PORT = parseInt(process.env.PORT || "8123", 10);
+  // Refuse to expose an unauthenticated machine to the public internet.
+  // Set ALLOW_UNAUTHENTICATED_TUNNEL=true only for trusted local testing.
+  if (!MCP_TOKEN && process.env.ALLOW_UNAUTHENTICATED_TUNNEL !== "true") {
+    console.error("❌ REFUSING TO START: MCP_TOKEN is not set.");
+    console.error("   An ngrok tunnel with no auth token exposes your filesystem and shell to anyone with the URL.");
+    console.error("   Set MCP_TOKEN in .env, or set ALLOW_UNAUTHENTICATED_TUNNEL=true to override (NOT recommended).");
+    process.exit(1);
+  }
+
   const DOMAIN = process.env.NGROK_DOMAIN;
 
   try {
@@ -77,7 +78,8 @@ async function boot() {
     console.log(`✅ COMPUTER ACCESS MCP READY`);
     console.log(`==================================================\n`);
     console.log(`🔗 CONNECTION URL (Paste into Notion Custom Agent):`);
-    console.log(`\x1b[36m${url}/sse\x1b[0m\n`);
+    console.log(`   Legacy SSE:      \x1b[36m${url}/sse\x1b[0m`);
+    console.log(`   Streamable HTTP: \x1b[36m${url}/mcp\x1b[0m\n`);
     
     if (process.env.MCP_TOKEN) {
       console.log(`🔑 AUTHORIZATION HEADER:`);
