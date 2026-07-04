@@ -1,0 +1,175 @@
+{
+  "_TODO": [
+    "All flags are betas \u2014 re-verify on CLI upgrades and adjust planMode/planSupported/args as findings land:",
+    "1. grok-build: interactive plan via Shift+Tab (\\u001b[Z) in the TUI is per-spec but UNVERIFIED end-to-end; if the pty drive misbehaves, the runtime undrivable\u2192fallback path plans via PLAN_FALLBACK_AGENT. Its --permission-mode plan flag exists in 0.2.77 --help but true-headless plan behavior is unconfirmed.",
+    "2. github-copilot-cli: oneshot '/plan' generating plan.md is UNVERIFIED (CLI not installed here); interactive escalation sends /plan into the TUI. Verify --allow-all-paths / --no-ask-user before first real build.",
+    "3. antigravity-agy 1.0.16: NO --plan flag exists locally (verified again 2026-07-04) \u2014 the spec'd headless entry is kept as data; at runtime the 'flag provided but not defined' output triggers automatic fallback to PLAN_FALLBACK_AGENT.",
+    "4. opencode 1.17.11: `run --auto` does NOT exist locally; the real flag is --dangerously-skip-permissions ('auto-approve permissions that are not explicitly denied' \u2014 honors deny rules). Re-check for --auto on upgrade.",
+    "5. Interactive sessions use node-pty when installed (npm install node-pty \u2014 optional), else a script(1) pty wrapper (macOS/Linux).",
+    "6. Per-provider: verify stdout streaming, exit codes, and auth persistence in a non-interactive context before relying on a new entry.",
+    "7. resumeArgsTemplate: claude/opencode/grok/agy --continue flags verified in local --help (continue-by-cwd matches worktree-scoped resume). codex resume syntax UNVERIFIED (not installed) and copilot has none \u2014 both omitted, so dead-job recovery for them follows RESUME_STRATEGY's rerun path.",
+    "8. acceptEditsArgs (supervised Mode): codex --full-auto is a deprecated alias for --sandbox workspace-write (approvals on escalation); opencode default posture asks per its permission config; copilot/grok/agy supervised postures rely on their interactive ask prompts relayed through the pty \u2014 all UNVERIFIED end-to-end against real CLIs."
+  ],
+  "claude-code": {
+    "command": "claude",
+    "buildArgs": [
+      "-p",
+      "{brief}",
+      "--dangerously-skip-permissions"
+    ],
+    "acceptEditsArgs": [
+      "-p",
+      "{brief}",
+      "--permission-mode",
+      "acceptEdits"
+    ],
+    "planMode": "headless",
+    "planArgs": [
+      "-p",
+      "{brief}",
+      "--permission-mode",
+      "plan"
+    ],
+    "resumeArgsTemplate": [
+      "-p",
+      "{nudge}",
+      "--continue",
+      "--dangerously-skip-permissions"
+    ],
+    "promptVia": "arg"
+  },
+  "codex": {
+    "command": "codex",
+    "buildArgs": [
+      "exec",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "{brief}"
+    ],
+    "acceptEditsArgs": [
+      "exec",
+      "--full-auto",
+      "{brief}"
+    ],
+    "planMode": "headless",
+    "planArgs": [
+      "exec",
+      "--sandbox",
+      "read-only",
+      "{brief}"
+    ],
+    "promptVia": "arg"
+  },
+  "opencode": {
+    "command": "opencode",
+    "buildArgs": [
+      "run",
+      "--dangerously-skip-permissions",
+      "{brief}"
+    ],
+    "acceptEditsArgs": [
+      "run",
+      "{brief}"
+    ],
+    "planMode": "headless",
+    "planArgs": [
+      "run",
+      "--agent",
+      "plan",
+      "{brief}"
+    ],
+    "resumeArgsTemplate": [
+      "run",
+      "--dangerously-skip-permissions",
+      "--continue",
+      "{nudge}"
+    ],
+    "promptVia": "arg"
+  },
+  "antigravity-agy": {
+    "command": "agy",
+    "buildArgs": [
+      "-p",
+      "{brief}",
+      "--dangerously-skip-permissions",
+      "--print-timeout",
+      "2h"
+    ],
+    "acceptEditsArgs": [
+      "-p",
+      "{brief}",
+      "--print-timeout",
+      "2h"
+    ],
+    "planMode": "headless",
+    "planArgs": [
+      "{workspace}",
+      "{brief}",
+      "--plan"
+    ],
+    "resumeArgsTemplate": [
+      "-p",
+      "{nudge}",
+      "--continue",
+      "--dangerously-skip-permissions",
+      "--print-timeout",
+      "2h"
+    ],
+    "promptVia": "arg"
+  },
+  "github-copilot-cli": {
+    "command": "copilot",
+    "buildArgs": [
+      "-p",
+      "{brief}",
+      "--allow-all-tools",
+      "--allow-all-paths",
+      "--no-ask-user"
+    ],
+    "acceptEditsArgs": [
+      "-p",
+      "{brief}"
+    ],
+    "planMode": "oneshot",
+    "planArgs": [
+      "-p",
+      "/plan {brief}",
+      "--allow-all-tools",
+      "--no-ask-user"
+    ],
+    "planOutputFile": "plan.md",
+    "planSend": [
+      "/plan {brief}\r"
+    ],
+    "planInteractiveArgs": [],
+    "promptVia": "arg"
+  },
+  "grok-build": {
+    "command": "grok",
+    "buildArgs": [
+      "-p",
+      "{brief}",
+      "--permission-mode",
+      "bypassPermissions"
+    ],
+    "acceptEditsArgs": [
+      "-p",
+      "{brief}",
+      "--permission-mode",
+      "default"
+    ],
+    "planMode": "interactive",
+    "planSend": [
+      "\u001b[Z",
+      "{brief}\r"
+    ],
+    "planInteractiveArgs": [],
+    "resumeArgsTemplate": [
+      "-p",
+      "{nudge}",
+      "--permission-mode",
+      "bypassPermissions",
+      "--continue"
+    ],
+    "promptVia": "arg"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "_comment": "Board mapping: the bridge NEVER hard-codes Notion property or option names in logic — every writeback resolves through this file. Edit to match your board; the bridge only ever WRITES the machine-side statuses (in_progress, in_review, hold, rework, failed, merged). The human gates (todo, ready_for_dev, approved) are read-only to the bridge.",
+  "properties": {
+    "status": "Status",
+    "mode": "Mode",
+    "codingAgent": "Coding Agent",
+    "repoPath": "Repo Path",
+    "project": "Project",
+    "taskId": "Task ID",
+    "brief": "Brief",
+    "verifyCommand": "Verify Command"
+  },
+  "statusOptions": {
+    "todo": "Todo",
+    "planning": "Planning",
+    "ready_for_dev": "Ready for Dev",
+    "in_progress": "In Progress",
+    "in_review": "In Review",
+    "rework": "Rework",
+    "hold": "Hold",
+    "approved": "Approved",
+    "merged": "Merged",
+    "failed": "Failed"
+  },
+  "modeOptions": {
+    "auto": "Auto approve",
+    "accept_edits": "Accept edits"
+  }
+}

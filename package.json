@@ -1,6 +1,6 @@
 {
   "name": "computer-access",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Universal Cross-Platform Local Agent MCP Server",
   "type": "module",
   "main": "dist/server.js",

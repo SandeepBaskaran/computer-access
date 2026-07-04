@@ -1,0 +1,781 @@
+/**
+ * Build Board bridge smoke test.
+ *
+ * Drives src/bridge.ts directly — no ngrok, no express, no real coding CLI.
+ * Fixtures: temp git repos with local bare repos as `origin`, and shell-script
+ * "providers" registered in a test providers.json.
+ *
+ * Run: SMOKE_TMP=<scratch-dir> npx tsx tests/bridge-smoke.ts
+ */
+import { execFileSync } from "child_process";
+import { mkdirSync, writeFileSync, existsSync, rmSync, chmodSync, readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import os from "os";
+import path from "path";
+import { createBridge, originToWebUrl, slugifyTaskId } from "../src/bridge.js";
+import { JobStore } from "../src/jobs.js";
+import { WakeDetector } from "../src/wake.js";
+
+const TMP = process.env.SMOKE_TMP
+  ? path.join(process.env.SMOKE_TMP, `bridge-smoke-${process.pid}`)
+  : path.join(os.tmpdir(), `bridge-smoke-${process.pid}`);
+rmSync(TMP, { recursive: true, force: true });
+mkdirSync(TMP, { recursive: true });
+
+let passed = 0;
+let failed = 0;
+function assert(cond: boolean, name: string, detail?: string) {
+  if (cond) { passed++; console.log(`  ✅ ${name}`); }
+  else { failed++; console.error(`  ❌ ${name}${detail ? ` — ${detail}` : ""}`); }
+}
+function section(name: string) { console.log(`\n── ${name}`); }
+
+function sh(cwd: string, cmd: string, args: string[]): string {
+  return execFileSync(cmd, args, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+}
+function gitOut(repo: string, args: string[]): string { return sh(repo, "git", args).trim(); }
+
+function makeRepo(name: string, withOrigin = true): string {
+  const repo = path.join(TMP, "repos", name);
+  mkdirSync(repo, { recursive: true });
+  sh(repo, "git", ["init", "-b", "main"]);
+  sh(repo, "git", ["config", "user.email", "smoke@test.local"]);
+  sh(repo, "git", ["config", "user.name", "Bridge Smoke"]);
+  writeFileSync(path.join(repo, "README.md"), `# ${name}\n`);
+  sh(repo, "git", ["add", "-A"]);
+  sh(repo, "git", ["commit", "-m", "initial"]);
+  if (withOrigin) {
+    const bare = path.join(TMP, "origins", `${name}.git`);
+    mkdirSync(path.dirname(bare), { recursive: true });
+    sh(TMP, "git", ["init", "--bare", bare]);
+    sh(repo, "git", ["remote", "add", "origin", bare]);
+    sh(repo, "git", ["push", "-u", "origin", "main"]);
+  }
+  return repo;
+}
+
+// ── Fake providers: shell scripts standing in for coding CLIs ──
+const bin = path.join(TMP, "bin");
+mkdirSync(bin, { recursive: true });
+function script(name: string, body: string): string {
+  const p = path.join(bin, name);
+  writeFileSync(p, `#!/bin/bash\n${body}\n`);
+  chmodSync(p, 0o755);
+  return p;
+}
+const okSh = script("ok.sh", `date +%s%N >> provider-output.txt\necho "work done"`);
+const failSh = script("fail.sh", `echo "compile error: boom" >&2\nexit 1`);
+const silentSh = script("silent.sh", `sleep 30`);
+const stderrSh = script("stderr.sh", `for i in $(seq 1 14); do echo "progress $i" >&2; sleep 0.3; done\ndate +%s%N >> provider-output.txt`);
+const planSh = script("plan.sh", `echo "PLAN:"\necho "1. refactor the module"\necho "2. add tests"`);
+const planqSh = script("planq.sh", `echo "I looked at the schema."\necho "Which database should I use?"`);
+const oneshotSh = script("oneshot.sh", `printf '# The Plan\\n1. inspect the code\\n2. implement the fix\\n3. add regression tests\\n' > plan.md\necho "plan file written"`);
+const interactiveSh = script("interactive.sh", `read brief\necho "Planning: $brief"\necho "What framework should I use?"\nread ans\necho "FINAL PLAN: use $ans for the task with components and routing"`);
+const escalatorSh = script("escalator.sh", `if [ "$1" = "--oneshot" ]; then printf 'meh' > plan.md; exit 0; fi\nread brief\necho "Escalated session for: $brief"\necho "Which approach should we take?"\nread a\necho "ESCALATED PLAN: approach $a with full detail and steps"`);
+const badflagSh = script("badflag.sh", `echo "flag provided but not defined: --plan" >&2\nexit 2`);
+const askfailSh = script("askfail.sh", `brief=$(cat)\nif echo "$brief" | grep -q "Answer to"; then echo "PLAN incorporating the answer: $brief"; exit 0; fi\necho "What DB should I use?"\nexit 3`);
+const reattachSh = script("reattach.sh", `date +%s%N >> provider-output.txt\nsleep 30`);
+// Supervised (accept_edits) fixture: applies an edit, then pauses on a higher-risk step
+const supervisedSh = script("supervised.sh", `echo "applying edits..."\necho "edited content" > supervised-edit.txt\necho "May I run npm install to add the new dependency?"\nread ans\necho "approval received: $ans"\ndate +%s%N >> provider-output.txt`);
+const resumableSh = script("resumable.sh", `if [ "$1" = "--resumed" ]; then echo "resumed work" >> provider-output.txt; exit 0; fi\nsleep 30`);
+const rerunSh = script("rerun.sh", `if [ -f .ran-once ]; then date +%s%N >> provider-output.txt; exit 0; fi\ntouch .ran-once\nsleep 30`);
+const noopSh = script("noop.sh", `echo "analyzed the repo, nothing to change"`);
+// Fails with a rate-limit message on the first run, succeeds once .quota-marker exists.
+const quotaSh = script("quota.sh", `if [ ! -f .quota-marker ]; then touch .quota-marker; echo "error: 429 rate limit exceeded, try again later" >&2; exit 1; fi\ndate +%s%N >> provider-output.txt\necho "work done after retry"`);
+
+const registryPath = path.join(TMP, "providers.json");
+writeFileSync(registryPath, JSON.stringify({
+  "ok":      { command: okSh,     buildArgs: [], promptVia: "stdin" }, // no planArgs → planSupported:false
+  "fail":    { command: failSh,   buildArgs: [], promptVia: "stdin" },
+  "silent":  { command: silentSh, buildArgs: [], promptVia: "stdin" },
+  "stderr":  { command: stderrSh, buildArgs: [], promptVia: "stdin" },
+  "noop":    { command: noopSh,   buildArgs: [], promptVia: "stdin" },
+  "quota":   { command: quotaSh,  buildArgs: [], promptVia: "stdin" },
+  "planner": { command: planSh,   buildArgs: [], planArgs: ["--plan-mode"], planSupported: true, promptVia: "stdin" },
+  "planq":   { command: planqSh,  buildArgs: [], planArgs: ["--plan-mode"], planSupported: true, promptVia: "stdin" },
+  "planSlow": { command: silentSh, buildArgs: [], planArgs: ["--plan-mode"], planSupported: true, promptVia: "stdin" },
+  "oneshot":  { command: oneshotSh, buildArgs: [], planMode: "oneshot", planArgs: ["--oneshot"], planOutputFile: "plan.md", promptVia: "stdin" },
+  "interactive": { command: interactiveSh, buildArgs: [], planMode: "interactive", planSend: ["{brief}\r"], planInteractiveArgs: [], promptVia: "arg" },
+  "escalator": { command: escalatorSh, buildArgs: [], planMode: "oneshot", planArgs: ["--oneshot"], planOutputFile: "plan.md", planSend: ["{brief}\r"], planInteractiveArgs: [], promptVia: "stdin" },
+  "badflag":  { command: badflagSh, buildArgs: [], planMode: "headless", planArgs: ["--plan"], promptVia: "stdin" },
+  "askfail":  { command: askfailSh, buildArgs: [], planMode: "headless", planArgs: ["run"], promptVia: "stdin" },
+  "undrivable-pty": { command: path.join(bin, "missing-tui"), buildArgs: [], planMode: "interactive", planSend: ["x"], planInteractiveArgs: [], promptVia: "arg" },
+  "reattach": { command: reattachSh, buildArgs: [], promptVia: "stdin" },
+  "supervised": { command: supervisedSh, buildArgs: ["--auto-mode"], acceptEditsArgs: ["--supervised", "{brief}"], promptVia: "arg" },
+  "resumable": { command: resumableSh, buildArgs: [], promptVia: "stdin", resumeArgsTemplate: ["--resumed", "{nudge}"] },
+  "rerun": { command: rerunSh, buildArgs: [], promptVia: "stdin" },
+  "enoent":  { command: path.join(bin, "does-not-exist"), buildArgs: [], promptVia: "arg" },
+  "stub":    { command: "", buildArgs: [], promptVia: "arg" },
+}, null, 2));
+
+function makeBridge(name: string, overrides: Partial<Parameters<typeof createBridge>[0]> = {}) {
+  return createBridge({
+    dataDir: path.join(TMP, "data", name),
+    registryPath,
+    worktreeRoot: path.join(TMP, "worktrees", name),
+    defaultProvider: "ok",
+    maxConcurrentJobs: 10,
+    heartbeatTimeoutMs: 15 * 60 * 1000,
+    jobMaxRuntimeMs: 2 * 60 * 60 * 1000,
+    revertWindowHours: 168,
+    planTimeoutMs: 60000,
+    holdRetryMs: 200,
+    planFallbackAgent: "", // no fallback unless a test opts in
+    planMinChars: 10,
+    planIdleMs: 700,
+    resumeStrategy: "resume" as const,
+    selfScanIntervalMs: 0, // scans only when a test calls scanBoardOnce
+    wakeGapMs: 120000,
+    confirmationGateEnabled: () => false,
+    isPathAllowed: async () => true,
+    ...overrides,
+  });
+}
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+async function waitForTerminal(bridge: any, taskId: string, timeoutMs = 30000): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const s = await bridge.getJobStatus(taskId);
+    if (s.state && s.state !== "in_progress" && s.state !== "planning") return s;
+    await sleep(250);
+  }
+  return bridge.getJobStatus(taskId);
+}
+
+async function waitForState(bridge: any, taskId: string, want: string, timeoutMs = 20000): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const s = await bridge.getJobStatus(taskId);
+    if (s.state === want) return s;
+    await sleep(200);
+  }
+  return bridge.getJobStatus(taskId);
+}
+
+async function main() {
+  // ═══ 1. Happy path: async start → in_review → merge → revert ═══
+  section("1. Happy path (async start, commit, push, --no-ff merge, branch kept, revert)");
+  const bridge = makeBridge("main");
+  const repo1 = makeRepo("repo1");
+  const t0 = Date.now();
+  const r1 = await bridge.startTask({ taskId: "101", pageId: "page-101", repoPath: repo1, brief: "add the feature" });
+  assert(Date.now() - t0 < 5000 && r1.state === "in_progress", "startTask returns immediately with state=in_progress", JSON.stringify(r1));
+  assert(r1.branch === "task/101", "branch is task/<id>", r1.branch);
+  assert(!r1.worktree.startsWith(repo1), "worktree is OUTSIDE the repo tree", r1.worktree);
+
+  const s1 = await waitForTerminal(bridge, "101");
+  assert(s1.state === "in_review", "job reaches in_review", JSON.stringify(s1.error));
+  assert(gitOut(repo1, ["log", "task/101", "--oneline"]).includes("task/101: add the feature"), "commit exists on task/101 with task/<id>: <summary> message");
+  const bare1 = path.join(TMP, "origins", "repo1.git");
+  assert(gitOut(bare1, ["branch", "--list", "task/101"]).includes("task/101"), "branch pushed to bare origin");
+  assert(typeof s1.logExcerpt === "string" && s1.logExcerpt.includes("work done"), "getJobStatus returns log excerpt");
+
+  // merge refusal on dirty tree
+  writeFileSync(path.join(repo1, "dirty.txt"), "uncommitted");
+  const mDirty = await bridge.mergeTask("101");
+  assert(mDirty.merged === false && mDirty.error === "dirtyWorkingTree", "merge refused on dirty working tree", JSON.stringify(mDirty));
+  rmSync(path.join(repo1, "dirty.txt"));
+
+  // merge refusal on wrong state (fresh unknown task)
+  const mUnknown = await bridge.mergeTask("999");
+  assert(mUnknown.merged === false && mUnknown.error === "notFound", "merge of unknown task refused");
+
+  const m1 = await bridge.mergeTask("101");
+  assert(m1.merged === true && !!m1.mergeCommit, "merge succeeds", JSON.stringify(m1));
+  const parents = gitOut(repo1, ["rev-list", "--parents", "-n", "1", m1.mergeCommit]).split(" ");
+  assert(parents.length === 3, "--no-ff produced a real merge commit (2 parents)");
+  assert(gitOut(bare1, ["rev-parse", "main"]) === m1.mergeCommit, "main pushed to origin");
+  assert(gitOut(repo1, ["branch", "--list", "task/101"]).includes("task/101"), "branch KEPT after merge");
+  assert(!existsSync(r1.worktree), "worktree removed at merge");
+
+  // double-merge refused
+  const m1b = await bridge.mergeTask("101");
+  assert(m1b.merged === false && m1b.error === "invalidState", "second merge refused (state=merged)");
+
+  // revert within window
+  const rv = await bridge.mergeTask("101", "revert");
+  assert(rv.reverted === true, "revert succeeds within window", JSON.stringify(rv));
+  assert(gitOut(repo1, ["log", "-1", "--format=%s", "main"]).startsWith("Revert"), "main HEAD is the revert commit");
+  const rvAgain = await bridge.mergeTask("101", "revert");
+  assert(rvAgain.merged === false && rvAgain.error === "invalidState", "second revert refused (state=reverted)");
+
+  // ═══ 2. Verify precedence + verify-fail keeps work local ═══
+  section("2. verifyCommand (param fail → failed, committed locally, NOT pushed)");
+  const repo2 = makeRepo("repo2");
+  await bridge.startTask({ taskId: "102", pageId: "page-102", repoPath: repo2, brief: "verify fails", verifyCommand: "echo 'tests failed'; exit 1" });
+  const s2 = await waitForTerminal(bridge, "102");
+  assert(s2.state === "failed", "verify failure → state=failed", s2.state);
+  assert((s2.error ?? "").includes("Verify command failed"), "error names the verify failure", s2.error);
+  assert(gitOut(repo2, ["log", "task/102", "--oneline"]).length > 0, "work committed locally on task branch");
+  const bare2 = path.join(TMP, "origins", "repo2.git");
+  assert(!gitOut(bare2, ["branch", "--list", "task/102"]).includes("task/102"), "nothing pushed on verify failure");
+
+  // .buildboard.json fallback
+  const repo3 = makeRepo("repo3");
+  writeFileSync(path.join(repo3, ".buildboard.json"), JSON.stringify({ verifyCommand: "exit 1" }));
+  sh(repo3, "git", ["add", "-A"]); sh(repo3, "git", ["commit", "-m", "add buildboard config"]); sh(repo3, "git", ["push", "origin", "main"]);
+  await bridge.startTask({ taskId: "103", pageId: "page-103", repoPath: repo3, brief: "buildboard verify" });
+  const s3 = await waitForTerminal(bridge, "103");
+  assert(s3.state === "failed" && (s3.error ?? "").includes("exit 1"), ".buildboard.json verifyCommand is picked up and enforced", s3.error);
+
+  // ═══ 3. Fast non-zero exit + ENOENT never strand in_progress ═══
+  section("3. Provider failure modes (fast exit 1, ENOENT, unknown/stub provider)");
+  const repo4 = makeRepo("repo4");
+  await bridge.startTask({ taskId: "104", pageId: "page-104", repoPath: repo4, brief: "crash fast", codingAgent: "fail" });
+  const s4 = await waitForTerminal(bridge, "104");
+  assert(s4.state === "failed", "provider exit 1 → failed (not stranded in_progress)", s4.state);
+  assert((s4.error ?? "").includes("exited with code 1") && (s4.error ?? "").includes("compile error: boom"), "exit code and stderr output captured in error", s4.error);
+
+  await bridge.startTask({ taskId: "105", pageId: "page-105", repoPath: repo4, brief: "bad binary", codingAgent: "enoent" });
+  const s5 = await waitForTerminal(bridge, "105");
+  assert(s5.state === "failed" && (s5.error ?? "").includes("could not be started"), "ENOENT command → failed with spawn error", s5.error);
+
+  const unknownErr = await bridge.startTask({ taskId: "106", pageId: "page-106", repoPath: repo4, brief: "x", codingAgent: "nope" }).catch((e: any) => e.message);
+  assert(typeof unknownErr === "string" && unknownErr.includes("Unknown coding agent") && unknownErr.includes("ok"), "unknown provider fails fast, lists usable providers", unknownErr);
+  const stubErr = await bridge.startTask({ taskId: "107", pageId: "page-107", repoPath: repo4, brief: "x", codingAgent: "stub" }).catch((e: any) => e.message);
+  assert(typeof stubErr === "string" && stubErr.includes("stub"), "stub provider fails fast with clear message", stubErr);
+
+  // ═══ 4. Idempotency + stale kill + stderr-only liveness (3s heartbeat bridge) ═══
+  section("4. alreadyRunning dedup, stale-heartbeat kill, stderr-only NOT falsely killed");
+  const fastBridge = makeBridge("fast", { heartbeatTimeoutMs: 3000 });
+  const repo5 = makeRepo("repo5");
+  const rSilent = await fastBridge.startTask({ taskId: "201", pageId: "page-201", repoPath: repo5, brief: "sleep", codingAgent: "silent" });
+  assert(rSilent.state === "in_progress", "silent job dispatched");
+  const dup = await fastBridge.startTask({ taskId: "201", pageId: "page-201", repoPath: repo5, brief: "sleep again", codingAgent: "silent" });
+  assert(dup.alreadyRunning === true, "duplicate dispatch (same pageId) → alreadyRunning, no second process", JSON.stringify(dup));
+
+  const repo6 = makeRepo("repo6");
+  await fastBridge.startTask({ taskId: "202", pageId: "page-202", repoPath: repo6, brief: "stderr progress", codingAgent: "stderr" });
+  await sleep(3500); // silent job is now stale; stderr job has been chattering on stderr only
+  await fastBridge.sweep();
+  const sSilent = await fastBridge.getJobStatus("201");
+  assert(sSilent.state === "failed" && (sSilent.error ?? "").includes("stale"), "truly-silent job killed by stale sweep", JSON.stringify({ state: sSilent.state, error: sSilent.error }));
+  const sStderr = await fastBridge.getJobStatus("202");
+  assert(sStderr.state === "in_progress" || sStderr.state === "in_review", "stderr-only job NOT falsely killed (heartbeat bumps on stderr)", sStderr.state);
+  const sStderrFinal = await waitForTerminal(fastBridge, "202");
+  assert(sStderrFinal.state === "in_review", "stderr-only job completes normally", sStderrFinal.error ?? sStderrFinal.state);
+
+  // ═══ 5. Concurrency cap ═══
+  section("5. Concurrency cap");
+  const capBridge = makeBridge("cap", { maxConcurrentJobs: 1, heartbeatTimeoutMs: 2500 });
+  const repo7 = makeRepo("repo7");
+  await capBridge.startTask({ taskId: "301", pageId: "page-301", repoPath: repo7, brief: "hog the slot", codingAgent: "silent" });
+  const capHit = await capBridge.startTask({ taskId: "302", pageId: "page-302", repoPath: repo7, brief: "wait my turn" });
+  assert(capHit.error === "capacityExceeded", "second dispatch at cap → capacityExceeded", JSON.stringify(capHit));
+  await sleep(3000);
+  await capBridge.sweep(); // clean up the hog
+
+  // ═══ 6. Rework: reuse branch + worktree, never recreate from main ═══
+  section("6. Rework re-dispatch");
+  const repo8 = makeRepo("repo8");
+  const rw1 = await bridge.startTask({ taskId: "401", pageId: "page-401", repoPath: repo8, brief: "first attempt", verifyCommand: "exit 1" });
+  const rwFail = await waitForTerminal(bridge, "401");
+  assert(rwFail.state === "failed", "first attempt fails (verify)", rwFail.state);
+  const commitBefore = gitOut(repo8, ["rev-parse", "task/401"]);
+  const rw2 = await bridge.startTask({ taskId: "401", pageId: "page-401", repoPath: repo8, brief: "second attempt, fix it", verifyCommand: "true" });
+  assert(rw2.rework === true && rw2.worktree === rw1.worktree, "rework reuses the SAME worktree path", `${rw1.worktree} vs ${rw2.worktree}`);
+  const rwOk = await waitForTerminal(bridge, "401");
+  assert(rwOk.state === "in_review", "rework attempt reaches in_review", rwOk.error ?? rwOk.state);
+  const log401 = gitOut(repo8, ["log", "task/401", "--format=%H"]).split("\n");
+  assert(log401.includes(commitBefore), "prior attempt's commit still present — branch NOT recreated from main");
+  assert(log401.length >= 2, "rework appended a new commit on top");
+
+  // ═══ 7. No-origin repo → graceful local-only ═══
+  section("7. No-origin repo");
+  const repo9 = makeRepo("repo9", false);
+  await bridge.startTask({ taskId: "501", pageId: "page-501", repoPath: repo9, brief: "local only work" });
+  const s9 = await waitForTerminal(bridge, "501");
+  assert(s9.state === "in_review" && s9.localOnly === true && s9.error === null, "no origin → in_review with localOnly:true, no push error", JSON.stringify({ state: s9.state, localOnly: s9.localOnly, error: s9.error }));
+
+  // ═══ 8. Merge conflict path ═══
+  section("8. Merge conflict");
+  const repo10 = makeRepo("repo10");
+  const rc = await bridge.startTask({ taskId: "601", pageId: "page-601", repoPath: repo10, brief: "conflicting work" });
+  const sc = await waitForTerminal(bridge, "601");
+  assert(sc.state === "in_review", "conflict fixture reaches in_review first", sc.error ?? sc.state);
+  // Diverge main: same file, different content → add/add conflict
+  writeFileSync(path.join(repo10, "provider-output.txt"), "conflicting main content\n");
+  sh(repo10, "git", ["add", "-A"]); sh(repo10, "git", ["commit", "-m", "diverge main"]);
+  const mc = await bridge.mergeTask("601");
+  assert(mc.merged === false && mc.conflict === true, "merge conflict detected, not merged", JSON.stringify(mc));
+  assert(Array.isArray(mc.conflictFiles) && mc.conflictFiles.includes("provider-output.txt"), "conflict files reported", JSON.stringify(mc.conflictFiles));
+  assert(existsSync(rc.worktree), "worktree kept intact on conflict (Rework can continue)");
+  assert(gitOut(repo10, ["status", "--porcelain"]) === "", "repo left clean after aborted merge");
+  const scAfter = await bridge.getJobStatus("601");
+  assert(scAfter.state === "in_review" && (scAfter.error ?? "").includes("conflict"), "job stays in_review with conflict noted", JSON.stringify({ state: scAfter.state, error: scAfter.error }));
+
+  // ═══ 9. Confirmation gate (break-glass) ═══
+  section("9. Break-glass confirmation gate");
+  const gatedBridge = makeBridge("gated", { confirmationGateEnabled: () => true });
+  const gRes = await gatedBridge.mergeTask("601");
+  assert(gRes.merged === false && gRes.error === "confirmationGateActive", "gate ON → merge-task refuses outright", JSON.stringify(gRes));
+
+  // ═══ 10. Restart recovery ═══
+  section("10. Restart recovery (durable store)");
+  const restartDb = path.join(TMP, "data", "restart", "jobs.sqlite");
+  const storeA = new JobStore(restartDb);
+  const baseRow = {
+    repo_path: repo1, provider: "ok", brief: "interrupted", verify_command: null,
+    pr_url: null, branch_url: null, merge_commit: null, error: null, local_only: null, plan: null, plan_provider: null, plan_complex: null, session_id: null, mode: null, board_id: null,
+    hold_reason: null, prev_state: null, question: null, hold_since: null,
+    pid: null, last_heartbeat: Date.now(), started_at: Date.now(), finished_at: null, merged_at: null, cleaned_at: null,
+  };
+  storeA.insert({ ...baseRow, task_id: "701", page_id: "page-701", branch: "task/701", worktree_path: "/nowhere", state: "in_progress" });
+  storeA.insert({ ...baseRow, task_id: "702", page_id: "page-702", branch: "", worktree_path: "", state: "planning" });
+  storeA.close();
+  const storeB = new JobStore(restartDb);
+  const recovered = storeB.recoverInterrupted();
+  const j701 = storeB.getByTaskId("701");
+  const j702 = storeB.getByTaskId("702");
+  assert(recovered === 2 && j701?.state === "failed" && (j701?.error ?? "").includes("bridge restarted"), "in_progress job marked failed on boot", JSON.stringify({ recovered, state: j701?.state }));
+  assert(j702?.state === "failed", "orphaned PLANNING job also marked failed on boot", j702?.state);
+  storeB.close();
+
+  // ═══ 11. Revert-window cleanup sweep ═══
+  section("11. Revert-window branch cleanup");
+  const zeroWindow = makeBridge("zerowin", { revertWindowHours: 0 });
+  const repo11 = makeRepo("repo11");
+  await zeroWindow.startTask({ taskId: "801", pageId: "page-801", repoPath: repo11, brief: "merge and clean" });
+  await waitForTerminal(zeroWindow, "801");
+  const m801 = await zeroWindow.mergeTask("801");
+  assert(m801.merged === true, "cleanup fixture merged", JSON.stringify(m801));
+  await sleep(50);
+  await zeroWindow.sweep();
+  assert(!gitOut(repo11, ["branch", "--list", "task/801"]).includes("task/801"), "expired branch deleted locally by sweep");
+  const bare11 = path.join(TMP, "origins", "repo11.git");
+  assert(!gitOut(bare11, ["branch", "--list", "task/801"]).includes("task/801"), "expired branch deleted on origin by sweep");
+
+  // ═══ 12. invalidRepo: exact reasons, never guessed paths ═══
+  section("12. invalidRepo validation");
+  const badPath = await bridge.startTask({ taskId: "901", pageId: "page-901", repoPath: path.join(TMP, "does-not-exist"), brief: "x" });
+  assert(badPath.error === "invalidRepo" && badPath.reason.includes("does not exist"), "nonexistent path → invalidRepo with exact reason", JSON.stringify(badPath));
+  const notGit = path.join(TMP, "not-a-repo");
+  mkdirSync(notGit, { recursive: true });
+  const badGit = await bridge.startTask({ taskId: "902", pageId: "page-902", repoPath: notGit, brief: "x" });
+  assert(badGit.error === "invalidRepo" && badGit.reason.includes("not a git repository"), "non-git dir → invalidRepo(not a git repository)", JSON.stringify(badGit));
+  const deniedBridge = makeBridge("denied", { isPathAllowed: async () => false });
+  const badAllow = await deniedBridge.startTask({ taskId: "903", pageId: "page-903", repoPath: repo1, brief: "x" });
+  assert(badAllow.error === "invalidRepo" && badAllow.reason.includes("ALLOWED_DIRS"), "path outside allowlist → invalidRepo(ALLOWED_DIRS)", JSON.stringify(badAllow));
+
+  // ═══ 13. plan-task: ASYNC read-only plan job ═══
+  section("13. plan-task (async job)");
+  const repoPlan = makeRepo("repoPlan");
+  const tPlan = Date.now();
+  const planStart = await bridge.planTask({ taskId: "1001", pageId: "page-1001", repoPath: repoPlan, brief: "plan the refactor", codingAgent: "planner" });
+  assert(Date.now() - tPlan < 3000 && planStart.started === true && planStart.state === "planning", "plan-task returns IMMEDIATELY with {started:true, state:planning}", JSON.stringify(planStart));
+  const planDone = await waitForTerminal(bridge, "1001");
+  assert(planDone.state === "planned", "plan job reaches state=planned", JSON.stringify({ state: planDone.state, error: planDone.error }));
+  assert(typeof planDone.plan === "string" && planDone.plan.includes("PLAN:") && planDone.plan.includes("add tests"), "planned job carries the plan text in the `plan` field", planDone.plan?.slice(0, 80));
+  assert(planDone.needsInput === false, "no pending question → needsInput:false");
+  assert(gitOut(repoPlan, ["status", "--porcelain"]) === "" && !gitOut(repoPlan, ["branch", "--list", "task/1001"]).includes("task/1001"), "plan run left the repo untouched (no writes, no branch)");
+
+  // alreadyPlanning dedup on a slow plan
+  const repoPlan2 = makeRepo("repoPlan2");
+  const slowPlanStart = await bridge.planTask({ taskId: "1002", pageId: "page-1002", repoPath: repoPlan2, brief: "slow plan", codingAgent: "planSlow" });
+  assert(slowPlanStart.started === true, "slow plan dispatched", JSON.stringify(slowPlanStart));
+  const dupPlan = await bridge.planTask({ taskId: "1002", pageId: "page-1002", repoPath: repoPlan2, brief: "slow plan again", codingAgent: "planSlow" });
+  assert(dupPlan.alreadyPlanning === true && dupPlan.started === false, "duplicate plan-task → alreadyPlanning, no second run", JSON.stringify({ started: dupPlan.started, alreadyPlanning: dupPlan.alreadyPlanning }));
+  // start-task during planning refuses
+  const buildDuringPlan = await bridge.startTask({ taskId: "1002", pageId: "page-1002", repoPath: repoPlan2, brief: "build now" });
+  assert(buildDuringPlan.error === "planningInProgress", "start-task during planning → planningInProgress", JSON.stringify(buildDuringPlan));
+  // cancel a planning job (no worktree to clean)
+  const cPlan = await bridge.cancelTask("1002");
+  assert(cPlan.cancelled === true, "planning job can be cancelled", JSON.stringify(cPlan));
+
+  // planned → build on the SAME task: fresh branch from main, plan retained
+  const buildAfterPlan = await bridge.startTask({ taskId: "1001", pageId: "page-1001", repoPath: repoPlan, brief: "now build it" });
+  assert(buildAfterPlan.state === "in_progress" && buildAfterPlan.branch === "task/1001", "start-task after planned → build begins on the same row", JSON.stringify(buildAfterPlan));
+  const builtAfterPlan = await waitForTerminal(bridge, "1001");
+  assert(builtAfterPlan.state === "in_review", "plan→build transition completes to in_review", builtAfterPlan.error ?? builtAfterPlan.state);
+
+  // needsInput: plan that ends with a question (exit 0) → planned + question
+  const planQStart = await bridge.planTask({ taskId: "1003", pageId: "page-1003", repoPath: repoPlan2, brief: "plan it", codingAgent: "planq" });
+  assert(planQStart.started === true, "question-plan dispatched", JSON.stringify(planQStart));
+  const planQDone = await waitForTerminal(bridge, "1003");
+  assert(planQDone.state === "planned" && planQDone.needsInput === true && (planQDone.question ?? "").includes("Which database"), "plan asking a question → planned with needsInput + question", JSON.stringify({ state: planQDone.state, needsInput: planQDone.needsInput, question: planQDone.question }));
+
+  // refusal + validation are still synchronous structured returns
+  const planRefuse = await bridge.planTask({ taskId: "1004", repoPath: repoPlan, brief: "plan it", codingAgent: "ok" });
+  assert(planRefuse.error === "planUnsupported" && planRefuse.planSupported === false && planRefuse.message.includes("planner"), "planSupported:false + NO fallback configured → planUnsupported refusal", JSON.stringify(planRefuse));
+  const planBadRepo = await bridge.planTask({ taskId: "1005", repoPath: path.join(TMP, "nope"), brief: "x", codingAgent: "planner" });
+  assert(planBadRepo.error === "invalidRepo", "plan-task validates the repo too", JSON.stringify(planBadRepo));
+
+  // ═══ 13b. PLAN_FALLBACK_AGENT routing ═══
+  section("13b. Plan fallback routing");
+  const fbBridge = makeBridge("fb", { planFallbackAgent: "planner" });
+  const repoFb = makeRepo("repoFb");
+  const fbStart = await fbBridge.planTask({ taskId: "1101fb", pageId: "page-1101fb", repoPath: repoFb, brief: "plan via fallback", codingAgent: "ok" });
+  assert(fbStart.started === true && fbStart.fallback === true, "planSupported:false + valid fallback → plan starts via fallback", JSON.stringify(fbStart));
+  assert(fbStart.provider === "ok" && fbStart.planProvider === "planner", "card's agent stays build provider; fallback is only the planner", JSON.stringify({ provider: fbStart.provider, planProvider: fbStart.planProvider }));
+  const fbDone = await waitForTerminal(fbBridge, "1101fb");
+  assert(fbDone.state === "planned" && (fbDone.plan ?? "").startsWith("Planned by planner (fallback"), "plan text prefixed with who planned it (fallback)", fbDone.plan?.slice(0, 60));
+  assert(fbDone.provider === "ok" && fbDone.planProvider === "planner", "job record keeps provider=card agent, planProvider=fallback");
+  // build after fallback-plan uses the CARD'S agent
+  const fbBuild = await fbBridge.startTask({ taskId: "1101fb", pageId: "page-1101fb", repoPath: repoFb, brief: "now build" });
+  assert(fbBuild.provider === "ok", "build after fallback-plan dispatches the card's own agent", fbBuild.provider);
+  const fbBuilt = await waitForTerminal(fbBridge, "1101fb");
+  assert(fbBuilt.state === "in_review" && fbBuilt.provider === "ok", "fallback-planned task builds to in_review with the card's agent", JSON.stringify({ state: fbBuilt.state, provider: fbBuilt.provider }));
+  // fallback that itself can't plan → refusal
+  const fbBadBridge = makeBridge("fbBad", { planFallbackAgent: "fail" });
+  const fbBad = await fbBadBridge.planTask({ taskId: "1102fb", repoPath: repoFb, brief: "plan it", codingAgent: "ok" });
+  assert(fbBad.error === "planUnsupported" && fbBad.planSupported === false && fbBad.message.includes("'fail' can't plan"), "invalid fallback (can't plan) → planUnsupported with explanation", JSON.stringify(fbBad));
+
+  // ═══ 13c. Plan modes: oneshot file capture, interactive pty round-trip, escalation, undrivable fallback ═══
+  section("13c. Plan modes (oneshot / interactive pty / escalation / undrivable)");
+  // (a) headless capture is covered by section 13's planner assertions.
+  // (b) oneshot: plan lands in plan.md, captured, repo left pristine
+  const repoOne = makeRepo("repoOne");
+  await bridge.planTask({ taskId: "2001", pageId: "page-2001", repoPath: repoOne, brief: "plan it", codingAgent: "oneshot" });
+  const oneDone = await waitForState(bridge, "2001", "planned");
+  assert(oneDone.state === "planned" && (oneDone.plan ?? "").includes("# The Plan") && (oneDone.plan ?? "").includes("regression tests"), "oneshot provider: generated plan.md captured into plan field", JSON.stringify({ state: oneDone.state, plan: oneDone.plan?.slice(0, 40) }));
+  assert(!existsSync(path.join(repoOne, "plan.md")), "generated plan.md cleaned up (untracked artifact deleted)");
+  assert(gitOut(repoOne, ["status", "--porcelain"]) === "", "oneshot plan left the repo pristine");
+
+  // (c) interactive: pty question → hold(needs_input) → answer-task → planned
+  const repoInt = makeRepo("repoInt");
+  await bridge.planTask({ taskId: "2002", pageId: "page-2002", repoPath: repoInt, brief: "build a dashboard", codingAgent: "interactive" });
+  const held = await waitForState(bridge, "2002", "hold");
+  assert(held.state === "hold" && held.holdReason === "needs_input", "interactive session pauses on the CLI's question → hold(needs_input)", JSON.stringify({ state: held.state, holdReason: held.holdReason }));
+  assert((held.question ?? "").includes("What framework should I use?"), "the CLI's exact prompt is captured in `question`", held.question);
+  const ansRes = await bridge.answerTask("2002", "react");
+  assert(ansRes.resumed === true && ansRes.mode === "session", "answer-task writes the reply into the LIVE pty session", JSON.stringify(ansRes));
+  const intDone = await waitForState(bridge, "2002", "planned");
+  assert(intDone.state === "planned" && (intDone.plan ?? "").includes("use react"), "session continues after the answer and completes → planned with the full transcript", JSON.stringify({ state: intDone.state, snippet: intDone.plan?.slice(-60) }));
+
+  // (d) escalation: thin one-shot plan → interactive session for the SAME provider
+  const repoEsc = makeRepo("repoEsc");
+  await bridge.planTask({ taskId: "2003", pageId: "page-2003", repoPath: repoEsc, brief: "complex feature", codingAgent: "escalator" });
+  const escHeld = await waitForState(bridge, "2003", "hold");
+  assert(escHeld.state === "hold" && (escHeld.question ?? "").includes("Which approach"), "thin one-shot plan ('meh') escalated to interactive, which asked a question", JSON.stringify({ state: escHeld.state, question: escHeld.question }));
+  assert(!existsSync(path.join(repoEsc, "plan.md")), "thin plan.md artifact was cleaned before escalation");
+  await bridge.answerTask("2003", "B");
+  const escDone = await waitForState(bridge, "2003", "planned");
+  assert(escDone.state === "planned" && (escDone.plan ?? "").includes("ESCALATED PLAN: approach B"), "escalated session produced the final plan", escDone.plan?.slice(-60));
+
+  // complex:true skips the cheap pass entirely
+  await bridge.planTask({ taskId: "2007", pageId: "page-2007", repoPath: repoEsc, brief: "tricky one", codingAgent: "escalator", complex: true });
+  const cxHeld = await waitForState(bridge, "2007", "hold");
+  assert(cxHeld.state === "hold" && (cxHeld.question ?? "").includes("Which approach"), "complex:true goes straight to the interactive session", JSON.stringify({ state: cxHeld.state }));
+  await bridge.answerTask("2007", "C");
+  const cxDone = await waitForState(bridge, "2007", "planned");
+  assert(cxDone.state === "planned" && (cxDone.plan ?? "").includes("approach C"), "complex plan completes interactively");
+
+  // (e) fallback fires ONLY when the plan mode is undrivable
+  const fbPtyStart = await fbBridge.planTask({ taskId: "2004", pageId: "page-2004", repoPath: repoFb, brief: "x", codingAgent: "undrivable-pty" });
+  assert(fbPtyStart.started === true, "undrivable interactive provider still dispatches (fallback is a runtime decision)", JSON.stringify(fbPtyStart));
+  const fbPtyDone = await waitForState(fbBridge, "2004", "planned");
+  assert(fbPtyDone.state === "planned" && (fbPtyDone.plan ?? "").startsWith("Planned by planner (fallback"), "pty spawn failure → PLAN_FALLBACK_AGENT produced the plan, attributed", fbPtyDone.plan?.slice(0, 50));
+  await fbBridge.planTask({ taskId: "2005", pageId: "page-2005", repoPath: repoFb, brief: "x", codingAgent: "badflag" });
+  const fbFlagDone = await waitForState(fbBridge, "2005", "planned");
+  assert(fbFlagDone.state === "planned" && (fbFlagDone.plan ?? "").startsWith("Planned by planner (fallback"), "unknown-flag rejection (config/binary drift) → fallback planned, attributed", fbFlagDone.plan?.slice(0, 50));
+
+  // dead-session resume: headless question (no live pty) → answer folds into the brief and re-plans
+  await bridge.planTask({ taskId: "2006", pageId: "page-2006", repoPath: repoInt, brief: "choose a db", codingAgent: "askfail" });
+  const askHeld = await waitForState(bridge, "2006", "hold");
+  assert(askHeld.holdReason === "needs_input" && (askHeld.question ?? "").includes("What DB"), "headless run asking a question → hold(needs_input) without a session", JSON.stringify({ holdReason: askHeld.holdReason, question: askHeld.question }));
+  const ans2 = await bridge.answerTask("2006", "postgres");
+  assert(ans2.resumed === true && ans2.mode === "replanned", "answer-task with no live session → cleanly re-plans with the answer folded in", JSON.stringify(ans2));
+  const askDone = await waitForState(bridge, "2006", "planned");
+  assert(askDone.state === "planned" && (askDone.plan ?? "").includes("postgres"), "re-planned run incorporates the human's answer", askDone.plan?.slice(-80));
+
+  // answer-task guards
+  const ansBad = await bridge.answerTask("2001", "irrelevant");
+  assert(ansBad.resumed === false && ansBad.error === "invalidState", "answer-task refused for a job not in hold(needs_input)", JSON.stringify(ansBad));
+
+  // ═══ 14. Empty diff → no commit, flagged ═══
+  section("14. Empty-diff build");
+  const repo12 = makeRepo("repo12");
+  await bridge.startTask({ taskId: "1101", pageId: "page-1101", repoPath: repo12, brief: "do nothing", codingAgent: "noop" });
+  const sNoop = await waitForTerminal(bridge, "1101");
+  assert(sNoop.state === "failed" && (sNoop.error ?? "").includes("no changes"), "empty diff → 'no changes', not committed", JSON.stringify({ state: sNoop.state, error: sNoop.error }));
+  assert(gitOut(repo12, ["rev-list", "--count", "main..task/1101"]) === "0", "branch has zero commits ahead of main");
+  const bare12 = path.join(TMP, "origins", "repo12.git");
+  assert(!gitOut(bare12, ["branch", "--list", "task/1101"]).includes("task/1101"), "nothing pushed for an empty diff");
+
+  // ═══ 15. hold(quota) → auto-retry restores prevState → in_review ═══
+  section("15. hold(quota) → sweep resume");
+  const repo13 = makeRepo("repo13");
+  await bridge.startTask({ taskId: "1201", pageId: "page-1201", repoPath: repo13, brief: "hit the rate limit", codingAgent: "quota" });
+  {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      const s = await bridge.getJobStatus("1201");
+      if (s.state === "hold") break;
+      await sleep(150);
+    }
+  }
+  const sHold = await bridge.getJobStatus("1201");
+  assert(sHold.state === "hold" && sHold.holdReason === "quota", "rate-limit output → hold(quota)", JSON.stringify({ state: sHold.state, holdReason: sHold.holdReason }));
+  assert(sHold.prevState === "in_progress", "prevState recorded for resume", sHold.prevState);
+  await sleep(300); // past holdRetryMs (200ms)
+  await bridge.sweep();
+  const sResumed = await waitForTerminal(bridge, "1201");
+  assert(sResumed.state === "in_review", "auto-retry restored prevState and the retry succeeded → in_review", JSON.stringify({ state: sResumed.state, error: sResumed.error }));
+  assert(sResumed.holdReason === null && sResumed.question === null, "hold fields cleared after resume");
+
+  // ═══ 16. Push failure → hold(blocked), commit kept local, localOnly ═══
+  section("16. Push failure → hold(blocked)");
+  const repo14 = makeRepo("repo14");
+  sh(repo14, "git", ["remote", "set-url", "origin", path.join(TMP, "origins", "gone.git")]);
+  await bridge.startTask({ taskId: "1301", pageId: "page-1301", repoPath: repo14, brief: "push will fail" });
+  const sPush = await waitForTerminal(bridge, "1301");
+  assert(sPush.state === "hold" && sPush.holdReason === "blocked", "failed push → hold(blocked), never silent success", JSON.stringify({ state: sPush.state, holdReason: sPush.holdReason }));
+  assert(sPush.localOnly === true, "commit flagged localOnly");
+  assert((sPush.error ?? "").includes("Push of task/1301 failed"), "push error surfaced verbatim", sPush.error);
+  assert(gitOut(repo14, ["rev-list", "--count", "main..task/1301"]) !== "0", "commit kept local on the task branch");
+
+  // ═══ 17. cancel-task: kill, remove worktree, KEEP branch ═══
+  section("17. cancel-task");
+  const repo15 = makeRepo("repo15");
+  const rCancel = await bridge.startTask({ taskId: "1401", pageId: "page-1401", repoPath: repo15, brief: "long run", codingAgent: "silent" });
+  await sleep(300);
+  const cRes = await bridge.cancelTask("1401");
+  assert(cRes.cancelled === true, "cancel-task cancels a running job", JSON.stringify(cRes));
+  assert(!existsSync(rCancel.worktree), "worktree removed on cancel");
+  assert(gitOut(repo15, ["branch", "--list", "task/1401"]).includes("task/1401"), "branch KEPT on cancel");
+  await sleep(300); // give the killed process's close handler a beat
+  const sCancel = await bridge.getJobStatus("1401");
+  assert(sCancel.state === "cancelled", "state is cancelled (late process-exit didn't overwrite it)", sCancel.state);
+  const cAgain = await bridge.cancelTask("1401");
+  assert(cAgain.cancelled === false && cAgain.error === "invalidState", "second cancel refused");
+  const rResume = await bridge.startTask({ taskId: "1401", pageId: "page-1401", repoPath: repo15, brief: "resume after cancel" });
+  assert(rResume.rework === true, "cancelled task can be re-dispatched (rework path)", JSON.stringify(rResume));
+  const sResume2 = await waitForTerminal(bridge, "1401");
+  assert(sResume2.state === "in_review", "re-dispatched cancelled task completes", sResume2.error ?? sResume2.state);
+
+  // ═══ 19. Power assertion: held while working, released when idle ═══
+  section("19. Power assertion");
+  const isAlive = (p: number | undefined) => { if (!p) return false; try { process.kill(p, 0); return true; } catch { return false; } };
+  const pwrBridge = makeBridge("pwr", { heartbeatTimeoutMs: 2500 });
+  const repoPwr = makeRepo("repoPwr");
+  await pwrBridge.startTask({ taskId: "3001", pageId: "page-3001", repoPath: repoPwr, brief: "long job", codingAgent: "silent" });
+  await sleep(300);
+  assert(pwrBridge.ops().powerAssertionHeld === true, "assertion HELD while a job is running", JSON.stringify(pwrBridge.ops().powerAssertionHeld));
+  assert(isAlive(pwrBridge.powerPid()), "caffeinate process is actually alive");
+  await sleep(2800); await pwrBridge.sweep(); // stale sweep kills the job → queue idle
+  assert(pwrBridge.ops().powerAssertionHeld === false, "assertion RELEASED when the queue is idle (Mac may sleep)");
+
+  // ═══ 20. Self-scan + wake routine ═══
+  section("20. Self-scan (fake board) + wake routine");
+  function makeFakeBoard(cards: any[], statusOverride?: (pageId: string) => string | null) {
+    const log: string[] = [];
+    return {
+      cards, log,
+      client: {
+        fetchCards: async (statuses: string[]) => cards.filter(c => statuses.includes(c.status)),
+        setStatus: async (pageId: string, status: string) => { const c = cards.find(x => x.pageId === pageId); if (c) c.status = status; log.push(`status:${pageId}=${status}`); },
+        comment: async (pageId: string, text: string) => { log.push(`comment:${pageId}:${text.slice(0, 50)}`); },
+        getStatus: async (pageId: string) => statusOverride ? statusOverride(pageId) : (cards.find(x => x.pageId === pageId)?.status ?? null),
+      },
+    };
+  }
+  const repoScan = makeRepo("repoScan");
+  const board = makeFakeBoard([
+    { pageId: "pg-3101", taskId: "3101", status: "Ready for Dev", repoPath: repoScan, codingAgent: "silent", brief: "scan-dispatched work" },
+  ]);
+  let tunnelCalls = 0;
+  const scanBridge = makeBridge("scan", { boardClient: board.client, tunnelCheck: async () => { tunnelCalls++; return { up: true, url: "https://bridge.example.dev" }; } });
+  const scan1 = await scanBridge.scanBoardOnce("test");
+  assert(scan1.actions.some((a: string) => a.includes("dispatched")), "self-scan dispatches a Ready for Dev card", JSON.stringify(scan1.actions));
+  assert(board.cards[0].status === "In Progress", "card flipped to In Progress after dispatch", board.cards[0].status);
+  const j3101 = await scanBridge.getJobStatus("3101");
+  assert(j3101.state === "in_progress", "job store has the dispatched job");
+  // Simulate a stale board / cloud-agent race: card back in Ready for Dev while the job runs
+  board.cards[0].status = "Ready for Dev";
+  const scan2 = await scanBridge.scanBoardOnce("test");
+  assert(scan2.actions.some((a: string) => a.includes("dedup")), "self-scan does NOT double-dispatch (page-UUID dedup)", JSON.stringify(scan2.actions));
+  assert(board.log.filter(l => l.startsWith("comment:pg-3101")).length === 1, "only the first dispatch commented — one job, one comment");
+  await scanBridge.cancelTask("3101");
+  // Approved card with an in_review job → merged by the scan
+  const repoScan2 = makeRepo("repoScan2");
+  await scanBridge.startTask({ taskId: "3102", pageId: "pg-3102", repoPath: repoScan2, brief: "merge me" });
+  await waitForState(scanBridge, "3102", "in_review");
+  board.cards.push({ pageId: "pg-3102", taskId: "3102", status: "Approved", repoPath: repoScan2, codingAgent: "ok", brief: "merge me" });
+  const scan3 = await scanBridge.scanBoardOnce("test");
+  assert(scan3.actions.some((a: string) => a.includes("merged")), "self-scan merges an Approved card (same guards)", JSON.stringify(scan3.actions));
+  assert(board.cards.find(c => c.pageId === "pg-3102")?.status === "Merged", "card flipped to Merged");
+  // Wake routine: tunnel check + reconcile + self-scan
+  const beforeCalls = tunnelCalls;
+  const wakeRes = await scanBridge.triggerWake(300000);
+  assert(tunnelCalls > beforeCalls, "wake routine re-verified the tunnel");
+  assert(scanBridge.ops().lastWakeAt !== null && scanBridge.ops().tunnel.up === true && scanBridge.ops().tunnel.url === "https://bridge.example.dev", "ops() reports wake + tunnel state", JSON.stringify(scanBridge.ops().tunnel));
+  assert(wakeRes.scan !== undefined && wakeRes.recovery !== undefined, "wake ran reconcile + self-scan");
+  assert(WakeDetector.isWakeGap(15000, 320000, 120000) === true && WakeDetector.isWakeGap(15000, 15400, 120000) === false, "wake gap detector: big clock jump = wake, jitter ≠ wake");
+
+  // ═══ 21. Crash/reboot recovery: reattach alive, resume dead, strategies ═══
+  section("21. Recovery (reattach / resume / rerun / rework / board-moved-on)");
+  // (i) alive job REATTACHES — no relaunch
+  const repoRec = makeRepo("repoRec");
+  const rb1 = makeBridge("rec");
+  await rb1.startTask({ taskId: "3201", pageId: "page-3201", repoPath: repoRec, brief: "long build", codingAgent: "reattach" });
+  await sleep(1800); // generous: first exec of a fresh script pays ~1s of macOS Gatekeeper latency
+  const jsProbe = new JobStore(path.join(TMP, "data", "rec", "jobs.sqlite"));
+  const alivePid = jsProbe.getByTaskId("3201")?.pid; jsProbe.close();
+  assert(!!alivePid && isAlive(alivePid), "provider process alive before simulated bridge crash");
+  rb1.close(); // bridge "crashes"; detached provider keeps running
+  const rb2 = makeBridge("rec");
+  await rb2.recoverNow("test");
+  const reattached = await rb2.getJobStatus("3201");
+  assert(reattached.state === "in_progress" && rb2.ops().reattachedJobs.includes("3201"), "alive orphan REATTACHED (state kept, no relaunch)", JSON.stringify({ state: reattached.state, watch: rb2.ops().reattachedJobs }));
+  process.kill(alivePid!, "SIGTERM");
+  await sleep(400); await rb2.sweep(); // pid gone → finish the pipeline
+  const finished = await waitForState(rb2, "3201", "in_review");
+  assert(finished.state === "in_review", "reattached job finished verify→commit→push after its process exited", finished.error ?? finished.state);
+  rb2.close();
+  // (ii) dead job WITH resumeArgsTemplate → resumed in the same worktree
+  const repoRec2 = makeRepo("repoRec2");
+  const rb3 = makeBridge("rec2");
+  await rb3.startTask({ taskId: "3301", pageId: "page-3301", repoPath: repoRec2, brief: "resumable build", codingAgent: "resumable" });
+  await sleep(1800);
+  const jsProbe2 = new JobStore(path.join(TMP, "data", "rec2", "jobs.sqlite"));
+  const deadPid = jsProbe2.getByTaskId("3301")?.pid; jsProbe2.close();
+  rb3.close(); // bridge dies FIRST (crash/reboot)…
+  process.kill(deadPid!, "SIGKILL"); // …then the orphaned provider dies too
+  await sleep(200);
+  const rb4 = makeBridge("rec2"); // RESUME_STRATEGY=resume (default)
+  await rb4.recoverNow("test");
+  const resumed = await waitForState(rb4, "3301", "in_review");
+  assert(resumed.state === "in_review", "dead job resumed via resumeArgsTemplate", resumed.error ?? resumed.state);
+  assert(sh(repoRec2, "git", ["show", "task/3301:provider-output.txt"]).includes("resumed work"), "resume run continued in the SAME worktree (resume marker committed)");
+  rb4.close();
+  // (iii) dead job, RESUME_STRATEGY=rework → failed with a note
+  const repoRec3 = makeRepo("repoRec3");
+  const rb5 = makeBridge("rec3", { resumeStrategy: "rework" as const });
+  await rb5.startTask({ taskId: "3401", pageId: "page-3401", repoPath: repoRec3, brief: "will be interrupted", codingAgent: "silent" });
+  await sleep(300);
+  const jsProbe3 = new JobStore(path.join(TMP, "data", "rec3", "jobs.sqlite"));
+  const deadPid3 = jsProbe3.getByTaskId("3401")?.pid; jsProbe3.close();
+  rb5.close();
+  process.kill(deadPid3!, "SIGKILL");
+  await sleep(200);
+  const rb6 = makeBridge("rec3", { resumeStrategy: "rework" as const });
+  await rb6.recoverNow("test");
+  const reworked = await rb6.getJobStatus("3401");
+  assert(reworked.state === "failed" && (reworked.error ?? "").includes("RESUME_STRATEGY=rework"), "no-resume strategy=rework → failed with note for the board", JSON.stringify({ state: reworked.state, error: reworked.error }));
+  rb6.close();
+  // (iv) dead job, no resume template, strategy=resume → falls back to RERUN of the brief
+  const repoRec4 = makeRepo("repoRec4");
+  const rb7 = makeBridge("rec4");
+  await rb7.startTask({ taskId: "3501", pageId: "page-3501", repoPath: repoRec4, brief: "rerun me", codingAgent: "rerun" });
+  await sleep(1800); // let the first run actually create .ran-once before the simulated crash
+  const jsProbe4 = new JobStore(path.join(TMP, "data", "rec4", "jobs.sqlite"));
+  const deadPid4 = jsProbe4.getByTaskId("3501")?.pid; jsProbe4.close();
+  rb7.close();
+  process.kill(deadPid4!, "SIGKILL");
+  await sleep(200);
+  const rb8 = makeBridge("rec4");
+  await rb8.recoverNow("test");
+  const rerunDone = await waitForState(rb8, "3501", "in_review");
+  assert(rerunDone.state === "in_review", "provider without resume support → brief re-run in the same worktree", rerunDone.error ?? rerunDone.state);
+  rb8.close();
+  // (v) board moved on → never resumed
+  const repoRec5 = makeRepo("repoRec5");
+  const movedBoard = makeFakeBoard([], () => "Merged"); // board says this card is long gone
+  const rb9 = makeBridge("rec5", { boardClient: movedBoard.client });
+  await rb9.startTask({ taskId: "3601", pageId: "page-3601", repoPath: repoRec5, brief: "board moved on", codingAgent: "silent" });
+  await sleep(300);
+  const jsProbe5 = new JobStore(path.join(TMP, "data", "rec5", "jobs.sqlite"));
+  const deadPid5 = jsProbe5.getByTaskId("3601")?.pid; jsProbe5.close();
+  rb9.close();
+  process.kill(deadPid5!, "SIGKILL");
+  await sleep(200);
+  const rb10 = makeBridge("rec5", { boardClient: movedBoard.client });
+  await rb10.recoverNow("test");
+  const moved = await rb10.getJobStatus("3601");
+  assert(moved.state === "failed" && (moved.error ?? "").includes("moved to 'Merged'"), "job whose card left the active states is NOT resumed", JSON.stringify({ state: moved.state, error: moved.error }));
+  rb10.close();
+
+  // ═══ 22. Mode: accept_edits supervised build with question relay ═══
+  section("22. Mode: accept_edits (supervised build)");
+  const repoSup = makeRepo("repoSup");
+  const supStart = await bridge.startTask({ taskId: "4001", pageId: "page-4001", repoPath: repoSup, brief: "add a dependency", codingAgent: "supervised", mode: "accept_edits" });
+  assert(supStart.mode === "accept_edits", "start-task accepts mode and records it", supStart.mode);
+  const supHeld = await waitForState(bridge, "4001", "hold");
+  assert(supHeld.state === "hold" && supHeld.holdReason === "needs_input", "supervised build paused on the higher-risk step → hold(needs_input)", JSON.stringify({ state: supHeld.state, holdReason: supHeld.holdReason }));
+  assert((supHeld.question ?? "").includes("npm install"), "the CLI's exact approval question is captured", supHeld.question);
+  assert(existsSync(path.join(supStart.worktree, "supervised-edit.txt")), "file edit was auto-applied BEFORE the pause (accept-edits posture)");
+  const supAns = await bridge.answerTask("4001", "yes, approved");
+  assert(supAns.resumed === true && supAns.mode === "session" && supAns.state === "in_progress", "answer-task resumes the live BUILD session back to in_progress", JSON.stringify(supAns));
+  const supDone = await waitForState(bridge, "4001", "in_review");
+  assert(supDone.state === "in_review", "supervised build runs to completion after approval", supDone.error ?? supDone.state);
+  assert(gitOut(repoSup, ["show", "task/4001:supervised-edit.txt"]).includes("edited content"), "supervised edits committed on the task branch");
+  const supDefault = await bridge.startTask({ taskId: "4002", pageId: "page-4002", repoPath: repoSup, brief: "default mode check" });
+  assert(supDefault.mode === "auto", "mode defaults to auto (DEFAULT_MODE) when unset", supDefault.mode);
+
+  // ═══ 23. ALLOW_PACKAGE_INSTALLS policy ═══
+  section("23. ALLOW_PACKAGE_INSTALLS");
+  const repoInst = makeRepo("repoInst");
+  await bridge.startTask({ taskId: "4101", pageId: "page-4101", repoPath: repoInst, brief: "install allowed", verifyCommand: "echo simulating npm install && true" });
+  const instOk = await waitForState(bridge, "4101", "in_review");
+  assert(instOk.state === "in_review", "install command runs with no prompt when ALLOW_PACKAGE_INSTALLS=true (default)", instOk.error ?? instOk.state);
+  const noInstBridge = makeBridge("noinst", { allowPackageInstalls: false });
+  const repoInst2 = makeRepo("repoInst2");
+  await noInstBridge.startTask({ taskId: "4102", pageId: "page-4102", repoPath: repoInst2, brief: "install blocked", verifyCommand: "echo simulating npm install && true" });
+  const instBlocked = await waitForState(noInstBridge, "4102", "failed");
+  assert(instBlocked.state === "failed" && (instBlocked.error ?? "").includes("ALLOW_PACKAGE_INSTALLS=false"), "install command refused when ALLOW_PACKAGE_INSTALLS=false", JSON.stringify({ state: instBlocked.state, error: instBlocked.error }));
+  noInstBridge.close();
+
+  // ═══ 24. providers.json exposes three modes for every provider ═══
+  section("24. providers.json: auto / acceptEdits / plan for every provider");
+  const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const realRegistry = JSON.parse(readFileSync(path.join(repoRoot, "providers.json"), "utf-8"));
+  for (const [name, entry] of Object.entries<any>(realRegistry)) {
+    if (name.startsWith("_")) continue;
+    const hasAuto = Array.isArray(entry.buildArgs) && entry.buildArgs.length > 0;
+    const hasAccept = Array.isArray(entry.acceptEditsArgs) && entry.acceptEditsArgs.length > 0;
+    const hasPlan = !!entry.planMode || (Array.isArray(entry.planArgs) && entry.planArgs.length > 0);
+    assert(hasAuto && hasAccept && hasPlan, `${name}: auto + acceptEdits + plan all declared`, JSON.stringify({ hasAuto, hasAccept, hasPlan }));
+  }
+
+  // ═══ 25. board-map.json writeback (mock Notion client, custom names) ═══
+  section("25. Board-map writeback (no hard-coded names)");
+  const CUSTOM_MAP = {
+    statusOptions: {
+      todo: "Backlog", planning: "Thinking", ready_for_dev: "Ready", in_progress: "Doing",
+      in_review: "Reviewing 👀", rework: "Redo", hold: "Paused", approved: "Green-lit", merged: "Shipped", failed: "Broke",
+    },
+    modeOptions: { auto: "Full Auto", accept_edits: "Careful" },
+  };
+  const repoMap = makeRepo("repoMap");
+  const mapBoard = makeFakeBoard([
+    { pageId: "pg-5001", taskId: "5001", status: "Ready", repoPath: repoMap, codingAgent: "silent", brief: "careful work", mode: "Careful" },
+  ]);
+  const mapBridge = makeBridge("map", { boardClient: mapBoard.client, boardMap: CUSTOM_MAP as any, boardId: "ds-test-board" });
+  const mScan1 = await mapBridge.scanBoardOnce("test");
+  assert(mScan1.actions.some((a: string) => a.includes("dispatched")), "custom 'Ready' status recognized via board-map", JSON.stringify(mScan1.actions));
+  assert(mapBoard.cards[0].status === "Doing", "writeback used the CUSTOM in_progress name from board-map, not a hard-coded literal", mapBoard.cards[0].status);
+  const mJob = await mapBridge.getJobStatus("5001");
+  assert(mJob.mode === "accept_edits", "card's Mode select ('Careful') mapped to accept_edits via board-map", mJob.mode);
+  // Hold-cleared card returns to its prior machine state
+  mapBoard.cards[0].status = "Paused"; // human parked it; job is actually running
+  const mScan2 = await mapBridge.scanBoardOnce("test");
+  assert(mapBoard.cards[0].status === "Doing" && mScan2.actions.some((a: string) => a.includes("resumed")), "Hold-cleared card moved back to its prior state via map names", JSON.stringify(mScan2.actions));
+  await mapBridge.cancelTask("5001");
+  // In Progress job reaching in_review writes the custom review name, exactly once
+  const repoMap2 = makeRepo("repoMap2");
+  await mapBridge.startTask({ taskId: "5002", pageId: "pg-5002", repoPath: repoMap2, brief: "review me" });
+  await waitForState(mapBridge, "5002", "in_review");
+  mapBoard.cards.push({ pageId: "pg-5002", taskId: "5002", status: "Doing", repoPath: repoMap2, codingAgent: "ok", brief: "review me" });
+  await mapBridge.scanBoardOnce("test");
+  assert(mapBoard.cards.find(c => c.pageId === "pg-5002")?.status === "Reviewing 👀", "in_review writeback resolved through the map ('Reviewing 👀')");
+  const writesBefore = mapBoard.log.filter(l => l.startsWith("status:pg-5002")).length;
+  await mapBridge.scanBoardOnce("test"); // card no longer in a scanned status → nothing to do
+  const writesAfter = mapBoard.log.filter(l => l.startsWith("status:pg-5002")).length;
+  assert(writesBefore === 1 && writesAfter === 1, "no double-write when the scan (or the cloud agent) fires again — page-UUID + status funnel", `${writesBefore}→${writesAfter}`);
+  mapBridge.close();
+
+  // ═══ 18. Unit checks: compare URL + slugify ═══
+  section("18. Helpers");
+  assert(originToWebUrl("git@github.com:owner/repo.git") === "https://github.com/owner/repo", "ssh origin → web URL");
+  assert(originToWebUrl("https://github.com/owner/repo.git") === "https://github.com/owner/repo", "https origin → web URL");
+  assert(slugifyTaskId("BB 12/weird*chars") === "BB-12-weird-chars", "slugify is defensive", slugifyTaskId("BB 12/weird*chars"));
+
+  // ── Summary ──
+  console.log(`\n${"═".repeat(50)}\n${failed === 0 ? "✅ ALL PASSED" : "❌ FAILURES"}: ${passed} passed, ${failed} failed`);
+  bridge.close(); fastBridge.close(); capBridge.close(); gatedBridge.close(); zeroWindow.close(); deniedBridge.close(); fbBridge.close(); fbBadBridge.close(); pwrBridge.close(); scanBridge.close();
+  process.exit(failed === 0 ? 0 : 1);
+}
+
+main().catch(e => { console.error("SMOKE TEST CRASHED:", e); process.exit(1); });

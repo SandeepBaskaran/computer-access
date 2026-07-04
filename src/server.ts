@@ -5,7 +5,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { readFile, writeFile, mkdir, readdir, stat, rm, rename, realpath, appendFile, copyFile } from "fs/promises";
-import { exec, spawn } from "child_process";
+import { exec, spawn, execFileSync } from "child_process";
 import { watch as fsWatch } from "fs";
 import { promisify } from "util";
 import path from "path";
@@ -22,6 +22,9 @@ import { parse as csvParse } from "csv-parse/sync";
 import fg from "fast-glob";
 import { randomUUID } from "crypto";
 import Database from "better-sqlite3";
+import { createBridge, DEFAULT_BOARD_MAP, BoardMap } from "./bridge.js";
+import { createNotionBoardClient, DEFAULT_PROP_MAP, BoardClient, BoardPropMap } from "./notion.js";
+import { readFileSync } from "fs";
 
 // ── Environment Loading ─────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -58,6 +61,104 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "200", 10);
 
+// ── Build Board Bridge Configuration ────────────────────────
+const DEFAULT_PROVIDER = process.env.DEFAULT_PROVIDER || "claude-code";
+const rawWorktreeRoot = process.env.WORKTREE_ROOT || path.join(os.homedir(), ".build-board", "worktrees");
+const WORKTREE_ROOT = rawWorktreeRoot.startsWith("~")
+  ? path.join(os.homedir(), rawWorktreeRoot.slice(1))
+  : path.resolve(rawWorktreeRoot);
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "2", 10);
+const HEARTBEAT_TIMEOUT_MS = parseInt(process.env.HEARTBEAT_TIMEOUT_MS || String(15 * 60 * 1000), 10);
+const JOB_MAX_RUNTIME_MS = parseInt(process.env.JOB_MAX_RUNTIME_MS || String(2 * 60 * 60 * 1000), 10);
+const REVERT_WINDOW_HOURS = parseInt(process.env.REVERT_WINDOW_HOURS || "168", 10);
+const PLAN_TIMEOUT_MS = parseInt(process.env.PLAN_TIMEOUT_MS || String(10 * 60 * 1000), 10);
+const HOLD_RETRY_MS = parseInt(process.env.HOLD_RETRY_MS || String(30 * 60 * 1000), 10);
+const PLAN_FALLBACK_AGENT = process.env.PLAN_FALLBACK_AGENT ?? "claude-code";
+const PLAN_MIN_CHARS = parseInt(process.env.PLAN_MIN_CHARS || "200", 10);
+const PLAN_IDLE_MS = parseInt(process.env.PLAN_IDLE_MS || "20000", 10);
+const SELF_SCAN_INTERVAL_MS = parseInt(process.env.SELF_SCAN_INTERVAL_MS || "90000", 10);
+const WAKE_GAP_MS = parseInt(process.env.WAKE_GAP_MS || "120000", 10);
+const RESUME_STRATEGY = (["resume", "rerun", "rework"].includes(process.env.RESUME_STRATEGY || "") ? process.env.RESUME_STRATEGY : "resume") as "resume" | "rerun" | "rework";
+const TUNNEL_API_URL = process.env.TUNNEL_API_URL || "http://127.0.0.1:4040/api/tunnels";
+const ALLOW_PACKAGE_INSTALLS = process.env.ALLOW_PACKAGE_INSTALLS !== "false"; // user-authorized installs, default ON
+const DEFAULT_MODE = (process.env.DEFAULT_MODE === "accept_edits" ? "accept_edits" : "auto") as "auto" | "accept_edits";
+
+// ── board-map.json: property/option names the bridge writes — never hard-coded in logic ──
+function loadBoardMap(): { map: BoardMap; props: BoardPropMap } {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(__dirname, "../board-map.json"), "utf-8"));
+    const map: BoardMap = {
+      statusOptions: { ...DEFAULT_BOARD_MAP.statusOptions, ...(raw.statusOptions ?? {}) },
+      modeOptions: { ...DEFAULT_BOARD_MAP.modeOptions, ...(raw.modeOptions ?? {}) },
+    };
+    const p = raw.properties ?? {};
+    const props: BoardPropMap = {
+      status: p.status ?? DEFAULT_PROP_MAP.status,
+      taskId: p.taskId ?? DEFAULT_PROP_MAP.taskId,
+      repo: p.repoPath ?? DEFAULT_PROP_MAP.repo,
+      agent: p.codingAgent ?? DEFAULT_PROP_MAP.agent,
+      brief: p.brief ?? DEFAULT_PROP_MAP.brief,
+      verify: p.verifyCommand ?? DEFAULT_PROP_MAP.verify,
+      mode: p.mode ?? DEFAULT_PROP_MAP.mode,
+      project: p.project ?? DEFAULT_PROP_MAP.project,
+    };
+    return { map, props };
+  } catch (e: any) {
+    console.error(`[BRIDGE] board-map.json not loaded (${e.message}) — using default names.`);
+    return { map: DEFAULT_BOARD_MAP, props: DEFAULT_PROP_MAP };
+  }
+}
+const { map: BOARD_MAP, props: BOARD_PROPS } = loadBoardMap();
+
+// ── Self-scan board access (token via Keychain, never logged) ──
+function resolveSecretSync(value: string): string {
+  if (!value.startsWith("keychain:")) return value;
+  try {
+    return execFileSync("security", ["find-generic-password", "-s", value.slice("keychain:".length), "-w"], { encoding: "utf-8" }).trim();
+  } catch {
+    console.error(`[BRIDGE] Keychain lookup failed for '${value}' — self-scan disabled.`);
+    return "";
+  }
+}
+
+let boardClient: BoardClient | undefined;
+{
+  const rawToken = process.env.NOTION_TOKEN || "";
+  const dataSourceId = process.env.BOARD_DATA_SOURCE_ID || "";
+  if (rawToken && dataSourceId) {
+    const token = resolveSecretSync(rawToken);
+    if (token) {
+      boardClient = createNotionBoardClient(token, dataSourceId, {
+        status: process.env.BOARD_PROP_STATUS || BOARD_PROPS.status,
+        taskId: process.env.BOARD_PROP_TASK_ID || BOARD_PROPS.taskId,
+        repo: process.env.BOARD_PROP_REPO || BOARD_PROPS.repo,
+        agent: process.env.BOARD_PROP_AGENT || BOARD_PROPS.agent,
+        brief: process.env.BOARD_PROP_BRIEF || BOARD_PROPS.brief,
+        verify: process.env.BOARD_PROP_VERIFY || BOARD_PROPS.verify,
+        mode: process.env.BOARD_PROP_MODE || BOARD_PROPS.mode,
+        project: process.env.BOARD_PROP_PROJECT || BOARD_PROPS.project,
+      });
+      console.error("[BRIDGE] Board self-scan enabled.");
+    }
+  } else {
+    console.error("[BRIDGE] NOTION_TOKEN/BOARD_DATA_SOURCE_ID not set — self-scan disabled; the cloud agent pulse is the only dispatcher.");
+  }
+}
+
+// Tunnel liveness via the ngrok agent's local API (works for the launchd
+// tunnel service; the embedded start.ts tunnel has its own health check).
+async function defaultTunnelCheck(): Promise<{ up: boolean; url?: string }> {
+  try {
+    const res = await fetch(TUNNEL_API_URL, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return { up: false };
+    const data: any = await res.json();
+    const t = (data.tunnels ?? []).find((x: any) => x.public_url);
+    return { up: !!t, url: t?.public_url };
+  } catch {
+    return { up: false };
+  }
+}
+
 // ── Security: Kill Switch ───────────────────────────────────
 const KILL_SWITCH_PATH = path.join(os.homedir(), '.mcp_kill');
 
@@ -92,6 +193,9 @@ const DANGER_MAP: Record<string, Record<string, DangerLevel>> = {
     status: 'safe', log: 'safe', diff: 'safe', branch: 'safe',
     add: 'moderate', commit: 'moderate', stash: 'moderate', tag: 'moderate',
     push: 'dangerous', pull: 'dangerous', merge: 'dangerous', raw: 'dangerous',
+  },
+  'bridge-merge': {
+    merge: 'dangerous', revert: 'dangerous',
   },
 };
 
@@ -169,6 +273,38 @@ async function isPathAllowed(filePath: string): Promise<boolean> {
   }
 }
 
+// ── Build Board Bridge ──────────────────────────────────────
+// Durable task orchestration (start-task / get-job-status / merge-task).
+// Confirmation gate is break-glass: ON means merge-task refuses outright —
+// the board's Approved column is the real gate.
+const bridge = createBridge({
+  dataDir: path.join(__dirname, "../data"),
+  registryPath: path.join(__dirname, "../providers.json"),
+  worktreeRoot: WORKTREE_ROOT,
+  defaultProvider: DEFAULT_PROVIDER,
+  maxConcurrentJobs: MAX_CONCURRENT_JOBS,
+  heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,
+  jobMaxRuntimeMs: JOB_MAX_RUNTIME_MS,
+  revertWindowHours: REVERT_WINDOW_HOURS,
+  planTimeoutMs: PLAN_TIMEOUT_MS,
+  holdRetryMs: HOLD_RETRY_MS,
+  planFallbackAgent: PLAN_FALLBACK_AGENT,
+  planMinChars: PLAN_MIN_CHARS,
+  planIdleMs: PLAN_IDLE_MS,
+  resumeStrategy: RESUME_STRATEGY,
+  selfScanIntervalMs: SELF_SCAN_INTERVAL_MS,
+  wakeGapMs: WAKE_GAP_MS,
+  boardClient,
+  tunnelCheck: defaultTunnelCheck,
+  defaultMode: DEFAULT_MODE,
+  allowPackageInstalls: ALLOW_PACKAGE_INSTALLS,
+  boardMap: BOARD_MAP,
+  boardId: process.env.BOARD_DATA_SOURCE_ID || undefined,
+  confirmationGateEnabled: () => requiresConfirmation("bridge-merge", "merge", {}).required,
+  isPathAllowed,
+});
+bridge.startSweeps();
+
 // ── Helper: Directory Tree ──────────────────────────────────
 async function getDirectoryTree(dirPath: string, excludes: string[] = []): Promise<any> {
     const name = path.basename(dirPath);
@@ -188,6 +324,12 @@ async function getDirectoryTree(dirPath: string, excludes: string[] = []): Promi
 }
 
 // ── Security: Command Blocklist ─────────────────────────────
+// Package installs are USER-AUTHORIZED by design (these are the user's own
+// repos): with ALLOW_PACKAGE_INSTALLS=true (default) nothing here matches an
+// install. Only when the user opts out is the pattern enforced — and exec
+// already only runs inside ALLOWED_DIRS.
+const INSTALL_COMMAND_RE = /\b(npm|pnpm|yarn|bun)\s+(i|install|add)\b|\bpip3?\s+install\b|\bcargo\s+(install|add)\b|\bbrew\s+install\b|\bgem\s+install\b|\bpoetry\s+add\b|\buv\s+(pip\s+install|add)\b/i;
+
 const BLOCKED_COMMAND_PATTERNS: RegExp[] = [
   /rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|--force\s+)?\//,
   /rm\s+-[a-zA-Z]*r[a-zA-Z]*f/,
@@ -621,6 +763,10 @@ function createMcpServer(sessionId: string) {
               await auditLog("sys-manage", { action, command }, "BLOCKED", sessionId, "Blocked pattern.", targetDir);
               return { content: [{ type: "text" as const, text: "ACCESS DENIED: Blocked pattern." }] };
             }
+          }
+          if (!ALLOW_PACKAGE_INSTALLS && INSTALL_COMMAND_RE.test(command)) {
+            await auditLog("sys-manage", { action, command }, "BLOCKED", sessionId, "Installs disabled.", targetDir);
+            return { content: [{ type: "text" as const, text: "ACCESS DENIED: package installs are disabled (ALLOW_PACKAGE_INSTALLS=false)." }] };
           }
           // Stream stdout/stderr progress lines back over SSE so proxies see activity
           const writeEvent = activeSessions.get(sessionId)?.writeEvent;
@@ -1128,6 +1274,9 @@ function createMcpServer(sessionId: string) {
           if (!(await isPathAllowed(targetDir))) return { content: [{ type: "text" as const, text: "ACCESS DENIED." }] };
           for (const p of BLOCKED_COMMAND_PATTERNS) {
             if (p.test(command)) return { content: [{ type: "text" as const, text: "ACCESS DENIED: Blocked pattern." }] };
+          }
+          if (!ALLOW_PACKAGE_INSTALLS && INSTALL_COMMAND_RE.test(command)) {
+            return { content: [{ type: "text" as const, text: "ACCESS DENIED: package installs are disabled (ALLOW_PACKAGE_INSTALLS=false)." }] };
           }
           const id = randomUUID();
           const task: BackgroundTask = { id, command, status: "running", stdout: "", stderr: "", exitCode: null, startedAt: Date.now() };
@@ -1854,6 +2003,140 @@ function createMcpServer(sessionId: string) {
   });
 
   /**
+   * ── Build Board Tool 1: start-task ─────────────────────────
+   */
+  server.registerTool("start-task", {
+    title: "Build Board: Start Task",
+    description: "Dispatch a board task to a local coding-agent CLI. Creates an isolated git worktree on branch task/<taskId>, runs the provider asynchronously, and returns immediately. On success the branch is committed, pushed, and a PR/compare URL is recorded (state: in_review). Re-calling for a running task returns alreadyRunning; re-calling for a failed/in_review task is the Rework path (same branch/worktree, new brief).",
+    inputSchema: {
+      taskId: z.string().describe("Short board task ID (e.g. '102') — becomes branch task/<id>"),
+      pageId: z.string().describe("Notion page UUID — the idempotency/correlation key"),
+      repoPath: z.string().describe("Absolute path to the target git repository (must be inside ALLOWED_DIRS)"),
+      brief: z.string().describe("The work brief passed to the coding agent"),
+      codingAgent: z.string().optional().describe(`Provider from providers.json (default: ${DEFAULT_PROVIDER})`),
+      verifyCommand: z.string().optional().describe("Shell command run in the worktree after the agent finishes; non-zero exit fails the task. Falls back to .buildboard.json's verifyCommand, then skips."),
+      mode: z.enum(["auto", "accept_edits"]).optional().describe(`Execution posture from the card's Mode select: auto = full autonomy (skip-permissions), accept_edits = supervised (edits auto-apply; shell/installs/deletes pause and the question is relayed to the board via hold(needs_input) → answer-task). Default: ${DEFAULT_MODE}`)
+    }
+  }, async (params) => {
+    try {
+      const result = await bridge.startTask(params);
+      await auditLog("start-task", { taskId: params.taskId, pageId: params.pageId, provider: params.codingAgent }, "SUCCESS", sessionId, undefined, params.repoPath);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (e: any) {
+      await auditLog("start-task", { taskId: params.taskId, pageId: params.pageId }, "ERROR", sessionId, e.message, params.repoPath);
+      return { content: [{ type: "text" as const, text: `Start Task Error: ${e.message}` }] };
+    }
+  });
+
+  /**
+   * ── Build Board Tool: plan-task ────────────────────────────
+   */
+  server.registerTool("plan-task", {
+    title: "Build Board: Plan Task",
+    description: "Dispatch a READ-ONLY plan job — no branch, no worktree, no writes — and return IMMEDIATELY ({started:true}). Never blocks on a slow plan. Poll get-job-status: state 'planning' → still running; 'planned' → result in the `plan` field (+ needsInput/question when the agent asked something). If the card's codingAgent has no plan mode, the plan runs via PLAN_FALLBACK_AGENT (read-only) while the card's agent stays the build provider — the plan text says who planned it. Structured returns: alreadyPlanning, capacityExceeded, invalidRepo, planUnsupported (only when neither the card's agent nor a valid fallback can plan — never a write-mode fallback).",
+    inputSchema: {
+      taskId: z.string().describe("Short board task ID"),
+      pageId: z.string().optional().describe("Notion page UUID (correlation only; plans are stateless)"),
+      repoPath: z.string().describe("Absolute path to the target git repository (must be inside ALLOWED_DIRS)"),
+      brief: z.string().describe("What to plan"),
+      codingAgent: z.string().optional().describe(`Provider from providers.json (default: ${DEFAULT_PROVIDER})`),
+      complex: z.boolean().optional().describe("Mark the task complex: skip the cheap one-shot pass and go straight to an interactive plan session when the provider supports one")
+    }
+  }, async (params) => {
+    try {
+      const result = await bridge.planTask(params);
+      await auditLog("plan-task", { taskId: params.taskId, provider: params.codingAgent }, result.error ? "BLOCKED" : "SUCCESS", sessionId, result.error, params.repoPath);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (e: any) {
+      await auditLog("plan-task", { taskId: params.taskId }, "ERROR", sessionId, e.message, params.repoPath);
+      return { content: [{ type: "text" as const, text: `Plan Task Error: ${e.message}` }] };
+    }
+  });
+
+  /**
+   * ── Build Board Tool: answer-task ──────────────────────────
+   */
+  server.registerTool("answer-task", {
+    title: "Build Board: Answer Task",
+    description: "Relay a human's answer into a job paused on hold(needs_input). If the interactive plan session is still alive, the answer goes straight into the CLI; otherwise the answer is folded into the brief and the job cleanly re-runs. Loop: get-job-status question → post as board comment → human replies → answer-task → repeat until planned.",
+    inputSchema: {
+      taskId: z.string().describe("Board task ID of the held job"),
+      answer: z.string().describe("The human's reply to the job's `question`")
+    }
+  }, async ({ taskId, answer }) => {
+    try {
+      const result = await bridge.answerTask(taskId, answer);
+      await auditLog("answer-task", { taskId }, result.resumed ? "SUCCESS" : "BLOCKED", sessionId, result.error ?? result.message);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (e: any) {
+      await auditLog("answer-task", { taskId }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Answer Task Error: ${e.message}` }] };
+    }
+  });
+
+  /**
+   * ── Build Board Tool: cancel-task ──────────────────────────
+   */
+  server.registerTool("cancel-task", {
+    title: "Build Board: Cancel Task",
+    description: "Cancel a running or held job: kills the provider process, removes the worktree, KEEPS the branch (work done so far stays on task/<id>). Re-dispatching later with start-task resumes on the same branch.",
+    inputSchema: {
+      taskId: z.string().describe("Board task ID of the job to cancel")
+    }
+  }, async ({ taskId }) => {
+    try {
+      const result = await bridge.cancelTask(taskId);
+      await auditLog("cancel-task", { taskId }, result.cancelled ? "SUCCESS" : "BLOCKED", sessionId, result.error ?? result.message);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (e: any) {
+      await auditLog("cancel-task", { taskId }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Cancel Task Error: ${e.message}` }] };
+    }
+  });
+
+  /**
+   * ── Build Board Tool 2: get-job-status ─────────────────────
+   */
+  server.registerTool("get-job-status", {
+    title: "Build Board: Job Status",
+    description: "Report the durable state of bridge jobs. With taskId: full detail for one job including a log excerpt (post it as a board comment). Without: the 50 most recent jobs. State survives bridge restarts.",
+    inputSchema: {
+      taskId: z.string().optional().describe("Board task ID or Notion page UUID; omit to list recent jobs")
+    }
+  }, async ({ taskId }) => {
+    try {
+      const result = await bridge.getJobStatus(taskId);
+      await auditLog("get-job-status", { taskId }, "SUCCESS", sessionId);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (e: any) {
+      await auditLog("get-job-status", { taskId }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Job Status Error: ${e.message}` }] };
+    }
+  });
+
+  /**
+   * ── Build Board Tool 3: merge-task ─────────────────────────
+   */
+  server.registerTool("merge-task", {
+    title: "Build Board: Merge Task",
+    description: "Merge an approved task into main with --no-ff and push. Refuses unless the job is in_review and the repo's working tree is clean. The branch is KEPT for the revert window; the worktree is removed. On conflict returns {merged:false, conflict:true} and keeps everything intact (move the card to Rework). action:'revert' reverts a merged task's merge commit within the revert window (manual/operator use — not part of the board lifecycle).",
+    inputSchema: {
+      taskId: z.string().describe("Board task ID of the job to merge"),
+      action: z.enum(["merge", "revert"]).optional().describe("Default: merge")
+    }
+  }, async ({ taskId, action }) => {
+    try {
+      const result = await bridge.mergeTask(taskId, action ?? "merge");
+      const status = result.merged || result.reverted ? "SUCCESS" : "BLOCKED";
+      await auditLog("merge-task", { taskId, action: action ?? "merge" }, status, sessionId, result.error ?? result.message);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (e: any) {
+      await auditLog("merge-task", { taskId, action: action ?? "merge" }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Merge Task Error: ${e.message}` }] };
+    }
+  });
+
+  /**
    * ── MCP Prompts ──────────────────────────────────────────
    */
   server.registerPrompt("check-codebase", {
@@ -1952,13 +2235,15 @@ setInterval(() => {
 }, SESSION_CLEANUP_INTERVAL_MS).unref();
 
 const SERVER_START_TIME = Date.now();
-app.get("/health", (_req, res) => res.json({ status: "running" }));
 
 app.get("/status", (_req, res) => res.json({
   status: "running",
   uptimeSeconds: Math.floor((Date.now() - SERVER_START_TIME) / 1000),
   activeSessions: activeSessions.size,
   backgroundTasks: { total: backgroundTasks.size, running: Array.from(backgroundTasks.values()).filter(t => t.status === "running").length },
+  bridgeJobs: bridge.summary(),
+  bridgeOps: bridge.ops(),
+  usableProviders: bridge.listUsableProviders(),
   activeWatchers: fileWatchers.size,
   totalToolCalls: totalRequests,
   rateLimitWindow: RATE_LIMIT_WINDOW_MS,

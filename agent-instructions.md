@@ -70,6 +70,45 @@ Full local machine access: filesystem, shell, git, media, documents, and network
 - `web-search` — Search the web
 - `port-check` — Check if a port is in use
 
+**Build Board Bridge** (`plan-task` / `start-task` / `get-job-status` / `answer-task` / `cancel-task` / `merge-task`)
+- `plan-task` — Read-only planning job in the repo (no branch/worktree/writes); async, returns immediately
+- `start-task` — Dispatch a board task to a local coding agent (async, returns immediately)
+- `get-job-status` — Durable job state + log excerpt for board comments (includes `hold` details + plan `question`)
+- `answer-task` — Relay a human's reply into a job paused on `hold(needs_input)` (live session or clean re-run)
+- `cancel-task` — Kill a running/planning/held job; worktree removed, branch kept
+- `merge-task` — Gated `--no-ff` merge of an approved task into main (branch kept for the revert window)
+- See **Build Board Workflow** below — these tools are the ONLY way you run board tasks
+
+---
+
+## 🏗️ Build Board Workflow
+
+The Build Board (a Notion database) is the single control surface for autonomous coding tasks. The bridge exposes exactly three operations — you never orchestrate git or provider CLIs by hand for board tasks.
+
+**Board lifecycle → bridge calls:**
+
+| Board state | Who moves it | Your action |
+|---|---|---|
+| Draft / Todo | Human | Nothing — the bridge never sees drafts or todos |
+| Planning | Human (wants a plan first) | If no plan job exists: call `plan-task` with `taskId`, `pageId`, `repoPath`, `brief`, `codingAgent` — it returns `{started: true}` immediately and runs in the background. If the response is `alreadyPlanning` (or `get-job-status` says `planning`): skip this run, check next wake. When `get-job-status` says `planned`: write the `plan` field into the page body (if the card's agent can't plan, the bridge planned via a read-only fallback agent — the plan text says who planned it; the build will still use the card's agent); if `needsInput: true`, also post the `question` for the human. `{error: planUnsupported}` (only when no fallback is configured either) → comment that neither this provider nor a fallback can plan and move the card to Hold — do NOT build instead. `hold` with `quota` → the bridge auto-retries on its own; `session` → owner must re-login. `capacityExceeded`/`invalidRepo` → same handling as start-task |
+| Ready for Dev | Human (gate 1) | Call `start-task` with `taskId` (short board ID), `pageId` (Notion page UUID), `repoPath`, `brief`, the task's `codingAgent`, and `mode` from the card's **Mode** select (`Auto approve` → `"auto"`, `Accept edits` → `"accept_edits"`; omit when unset). In accept_edits, expect `hold(needs_input)` pauses whenever the CLI wants approval for shell/installs — post the `question`, relay the reply via `answer-task`. **Check the response before touching the card**: `state: in_progress` → move to In Progress. `alreadyRunning: true` → already dispatched; ensure the card is In Progress, don't re-dispatch. `capacityExceeded` → **the job did NOT start — leave the card in Ready for Dev** and retry next wake. `invalidRepo` → post the exact `reason` as a comment and leave the card — never guess a different path |
+| In Progress | You | Each wake: `get-job-status`. `in_review` → move to In Review, post `prUrl`/`branchUrl`; if `localOnly: true`, comment "built locally, not pushed (repo has no origin remote)". `failed` → move to Rework (or Failed), post `error` + `logExcerpt`. `hold` → move to Hold and see the hold table below |
+| Hold | Bridge (via job state) | Read `holdReason`: `needs_input` → post the `question` as a card comment; when the human replies, call **`answer-task`** with the reply verbatim — the bridge feeds it into the live CLI session (or cleanly re-runs with the answer folded in) and the loop continues until `planned`/`in_review`. `quota` → do nothing; the bridge auto-retries when the window clears. `session` → tell the owner to re-login to that provider, then re-dispatch. `blocked` → push failed (protected branch / non-fast-forward / auth); post the error; the commit is safe locally (`localOnly: true`) |
+| Rework | Human writes new brief | Call `start-task` again with the same `taskId`/`pageId` and the new brief — the bridge reuses the same branch and worktree |
+| Approved | Human (gate 2) | Call `merge-task` with the taskId. `{merged:true}` → move to Merged. `{merged:false, conflict:true}` → move to Rework and post the conflict files |
+| Merged / Failed | You | Terminal. Follow-up work = a new board task |
+| (any active state, human asks to stop) | Human | Call `cancel-task`. The worktree is removed but the branch is KEPT — re-dispatching later resumes from it |
+
+**Rules:**
+- The bridge also self-scans the board every ~90 s while the Mac is awake — you may find cards already dispatched, commented, or moved when you wake. That's normal: you and the bridge share one job store, so every call is idempotent (`alreadyRunning`, refused double-merges). Just reconcile what you see and move on.
+- `start-task` returns immediately (`state: in_progress`) — never wait for the build; check again on your next wake.
+- `alreadyRunning: true` means the task is already dispatched — do not retry, just report status.
+- `capacityExceeded` means the concurrency cap is full — leave the card in Ready for Dev and retry next wake.
+- The two human gates (Ready for Dev, Approved) live on the board. Never call `start-task` for a Draft, and never call `merge-task` unless the card is in Approved.
+- `merge-task` with `action: "revert"` exists but is **not part of your workflow** — it's a manual operator escape hatch used within the revert window. Never call it unless the user explicitly asks.
+- If `merge-task` returns `confirmationGateActive`, the owner has disabled autonomous merges (break-glass mode). Report it and stop — do not attempt to merge another way.
+- Post `logExcerpt` and `error` from `get-job-status` as board comments so failures are diagnosable from Notion.
+
 ---
 
 ## 🗂️ Project Context

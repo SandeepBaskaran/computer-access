@@ -1,0 +1,43 @@
+#!/bin/bash
+# buildboard — manage the Build Board bridge launchd service.
+#   buildboard start   — bootstrap the service (undoes a prior stop)
+#   buildboard stop    — REAL stop: bootout fully unloads it, KeepAlive won't fight you
+#   buildboard status  — launchctl state + bridge /status
+#   buildboard logs    — tail the service logs
+set -euo pipefail
+
+LABEL="com.buildboard.bridge"
+TUNNEL_LABEL="com.buildboard.tunnel"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$HOME/.build-board/logs"
+UID_N="$(id -u)"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT="$(grep -E '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"
+PORT="${PORT:-8123}"
+
+case "${1:-}" in
+  start)
+    [ -f "$PLIST" ] || { echo "not installed — run scripts/install-service.sh first" >&2; exit 1; }
+    launchctl bootstrap "gui/$UID_N" "$PLIST" 2>/dev/null || true
+    launchctl kickstart "gui/$UID_N/$LABEL"
+    echo "started $LABEL"
+    ;;
+  stop)
+    launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null && echo "stopped $LABEL (fully unloaded — stays down until 'buildboard start')" || echo "$LABEL was not running"
+    ;;
+  status)
+    echo "── launchd:"
+    launchctl print "gui/$UID_N/$LABEL" 2>/dev/null | grep -E "state|pid|last exit" || echo "  $LABEL: not loaded"
+    launchctl print "gui/$UID_N/$TUNNEL_LABEL" 2>/dev/null | grep -E "state|pid" | sed "s/^/  tunnel /" || echo "  $TUNNEL_LABEL: not loaded"
+    echo "── bridge /status:"
+    curl -s --max-time 3 "http://localhost:$PORT/status" || echo "  (bridge not responding on :$PORT)"
+    echo
+    ;;
+  logs)
+    tail -n "${2:-50}" -f "$LOG_DIR/bridge.err.log"
+    ;;
+  *)
+    echo "usage: buildboard start|stop|status|logs [n]" >&2
+    exit 1
+    ;;
+esac

@@ -11,6 +11,9 @@ dist/
 *.log
 audit.log
 
+# Build Board bridge state (job DB + per-job logs)
+data/
+
 # OS files
 .DS_Store
 Thumbs.db
