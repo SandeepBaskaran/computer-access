@@ -100,10 +100,17 @@ export class JobStore {
     mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
+    // Pre-release schema guard: a jobs table without the job_key column
+    // predates the current vocabulary and has no migration — archive it and
+    // start fresh instead of failing every query with "no such column".
+    const cols = this.db.prepare("SELECT name FROM pragma_table_info('jobs')").all() as Array<{ name: string }>;
+    if (cols.length > 0 && !cols.some(c => c.name === "job_key")) {
+      const archive = `jobs_legacy_${Date.now()}`;
+      this.db.exec(`ALTER TABLE jobs RENAME TO ${archive}`);
+      console.error(`[BRIDGE] jobs table predates the current schema — archived as ${archive}, starting fresh.`);
+    }
     this.db.exec(SCHEMA);
-    // Migrate databases created before the newer columns existed. (Pre-release
-    // databases with the old frontend-flavored dedup column must be deleted:
-    // rm data/jobs.sqlite — there is no migration for them.)
+    // Migrate databases created before the newer columns existed.
     for (const col of ["hold_reason TEXT", "prev_state TEXT", "question TEXT", "hold_since INTEGER", "plan TEXT", "plan_provider TEXT", "plan_complex INTEGER", "session_id TEXT", "mode TEXT", "pending_action TEXT", "diff_stat TEXT"]) {
       try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${col}`); } catch { /* column already exists */ }
     }
