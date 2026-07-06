@@ -79,9 +79,10 @@ async function boot() {
     console.log(`🔗 CONNECTION URL (paste into your MCP client's connector settings):`);
     console.log(`\x1b[36m${url}/sse\x1b[0m\n`);
     
-    if (process.env.MCP_TOKEN) {
+    const authToken = process.env.BRIDGE_AUTH_TOKEN || process.env.MCP_TOKEN;
+    if (authToken) {
       console.log(`🔑 AUTHORIZATION HEADER:`);
-      console.log(`Bearer ${process.env.MCP_TOKEN}\n`);
+      console.log(`Bearer ${authToken}\n`);
     }
 
     console.log(`==================================================`);
