@@ -161,7 +161,7 @@ export function createBridge(cfg: BridgeConfig) {
   const registryReady = loadProviders(cfg.registryPath).then(r => { registry = r; });
   // Boot recovery is smart, not blanket-fail: alive orphans reattach, dead
   // ones follow RESUME_STRATEGY (see recoverJobs below).
-  registryReady.then(() => recoverJobs("boot")).catch(e => console.error("[RECOVERY] boot recovery error:", e.message));
+  registryReady.then(() => recoverJobs("boot")).then(() => dispatchQueued("boot")).catch(e => console.error("[RECOVERY] boot recovery error:", e.message));
 
   const logPath = (taskId: string) => path.join(logsDir, `${taskId}.log`);
 
@@ -952,6 +952,11 @@ export function createBridge(cfg: BridgeConfig) {
       await git(job.repo_path, ["commit", "--allow-empty", "-m", `initial commit (git init authorized via job ${job.job_key})`]);
       console.error(`[JOB] ${job.task_id}: git init authorized and completed in ${job.repo_path}`);
       const target: JobState = job.prev_state === "planning" ? "planning" : "in_progress";
+      // Respect the concurrency cap: an authorized job joins the queue like any other.
+      if (store.countRunning() >= cfg.maxConcurrentJobs) {
+        store.update(job.task_id, { state: "queued", pending_action: target === "planning" ? "queued_plan" : "queued_build", hold_reason: null, question: null, hold_since: null, prev_state: null, error: null });
+        return { accepted: true, resumed: true, mode: "git_init", jobId: job.job_key, state: "queued" };
+      }
       if (target === "in_progress") {
         const worktree = job.worktree_path || path.join(cfg.worktreeRoot, job.task_id);
         await ensureWorktree({ repo_path: job.repo_path, branch: job.branch, worktree_path: worktree }, "main", false);

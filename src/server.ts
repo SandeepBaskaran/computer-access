@@ -86,7 +86,7 @@ try {
   });
 } catch { /* watcher is best-effort */ }
 
-const PORT = parseInt(process.env.PORT || "3000", 10);
+const PORT = parseInt(process.env.PORT || "8123", 10); // keep in sync with start.ts + service plists
 const COMMAND_TIMEOUT = parseInt(process.env.COMMAND_TIMEOUT || "30000", 10);
 // Generic bearer auth for the internet-exposed MCP endpoint. MCP_TOKEN is the legacy alias.
 const MCP_TOKEN = process.env.BRIDGE_AUTH_TOKEN || process.env.MCP_TOKEN;

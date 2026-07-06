@@ -110,7 +110,8 @@ export class JobStore {
       console.error(`[BRIDGE] jobs table predates the current schema — archived as ${archive}, starting fresh.`);
     }
     this.db.exec(SCHEMA);
-    // Migrate databases created before the newer columns existed.
+    // Migrate columns added AFTER the job_key rename. Anything older is
+    // caught by the schema guard above, so pre-rename columns need no ALTERs.
     for (const col of ["hold_reason TEXT", "prev_state TEXT", "question TEXT", "hold_since INTEGER", "plan TEXT", "plan_provider TEXT", "plan_complex INTEGER", "session_id TEXT", "mode TEXT", "pending_action TEXT", "diff_stat TEXT"]) {
       try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${col}`); } catch { /* column already exists */ }
     }

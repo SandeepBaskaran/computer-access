@@ -30,7 +30,8 @@ case "${1:-}" in
     launchctl print "gui/$UID_N/$LABEL" 2>/dev/null | grep -E "state|pid|last exit" || echo "  $LABEL: not loaded"
     launchctl print "gui/$UID_N/$TUNNEL_LABEL" 2>/dev/null | grep -E "state|pid" | sed "s/^/  tunnel /" || echo "  $TUNNEL_LABEL: not loaded"
     echo "── bridge /status:"
-    curl -s --max-time 3 "http://localhost:$PORT/status" || echo "  (bridge not responding on :$PORT)"
+    AUTH="$(grep -E '^(BRIDGE_AUTH_TOKEN|MCP_TOKEN)=' "$APP_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2 || true)"
+    curl -s --max-time 3 ${AUTH:+-H "Authorization: Bearer $AUTH"} "http://localhost:$PORT/status" || echo "  (bridge not responding on :$PORT)"
     echo
     ;;
   logs)
