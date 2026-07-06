@@ -70,6 +70,40 @@ Full local machine access: filesystem, shell, git, media, documents, and network
 - `web-search` — Search the web
 - `port-check` — Check if a port is in use
 
+**Background Tasks** (`task-manage`)
+- `run` / `status` / `logs` / `cancel` / `list` — Run long shell jobs without blocking the connection
+
+**Filesystem Watcher** (`watch-manage`)
+- `watch` / `poll` / `unwatch` / `list-watchers` — Watch paths for changes
+- `tail-log` — Tail the last N lines of a log file
+
+**Keychain** (`secret-manage`) — *disabled unless `ENABLE_SECRETS=true`*
+- `get` / `set` / `delete` / `list` — macOS Keychain secrets
+
+**Archives** (`archive-manage`)
+- `zip` / `unzip` / `tar` / `untar` / `list-contents`
+
+**SQLite** (`db-manage`)
+- `query` / `execute` / `schema` / `list-tables`
+
+**Diff & Patch** (`diff-manage`)
+- `file-diff` / `dir-diff` / `apply-patch` / `three-way-merge`
+
+**Code Formatter** (`code-format`)
+- `format` / `check` / `list-formatters` — prettier, black, gofmt, rustfmt, etc.
+
+**Structured Tests** (`test-manage`)
+- `run` / `run-file` / `coverage` — jest, vitest, pytest, go, cargo
+
+**Audit Explorer** (`audit-manage`)
+- `tail` / `search` / `stats` / `session-history`
+
+**Env Files** (`env-manage`)
+- `read` / `set` / `unset` / `validate` / `diff` — masked `.env` management
+
+**Window Control** (`window-manage`)
+- `list` / `focus` / `resize` / `move` / `screenshot-window` / `applescript`
+
 **Build Board Bridge** (`plan` / `start` / `get_status` / `answer` / `cancel` / `merge`)
 - `plan` — Read-only planning job in the repo (no branch/worktree/writes); async, returns immediately
 - `start` — Dispatch a board task to a local coding agent (async, returns immediately)
@@ -100,10 +134,9 @@ The Build Board (a Notion database) is the single control surface for autonomous
 | (any active state, human asks to stop) | Human | Call `cancel`. The worktree is removed but the branch is KEPT — re-dispatching later resumes from it |
 
 **Rules:**
-- The bridge also self-scans the board every ~90 s while the Mac is awake — you may find cards already dispatched, commented, or moved when you wake. That's normal: you and the bridge share one job store, so every call is idempotent (`alreadyRunning`, refused double-merges). Just reconcile what you see and move on.
-- `start` returns immediately (`state: in_progress`) — never wait for the build; check again on your next wake.
+- `start` returns immediately (`state: running` or `queued`) — never wait for the build; check again on your next wake.
 - `alreadyRunning: true` means the task is already dispatched — do not retry, just report status.
-- `capacityExceeded` means the concurrency cap is full — leave the card in Ready for Dev and retry next wake.
+- `queued: true` means the concurrency cap is full — the job waits in the bridge's FIFO queue and starts itself; move the card to In Progress and never re-dispatch it.
 - The two human gates (Ready for Dev, Approved) live on the board. Never call `start` for a Draft, and never call `merge` unless the card is in Approved.
 - `merge` with `action: "revert"` exists but is **not part of your workflow** — it's a manual operator escape hatch used within the revert window. Never call it unless the user explicitly asks.
 - If `merge` returns `confirmationGateActive`, the owner has disabled autonomous merges (break-glass mode). Report it and stop — do not attempt to merge another way.

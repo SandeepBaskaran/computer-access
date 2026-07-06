@@ -1,6 +1,6 @@
-# Computer Access MCP v1.1
+# Computer Access MCP v2.0
 
-> **v1.1** — Give cloud AI agents hands on your local machine, and an orchestrator for the local coding agents you already use
+> **v2.0** — Give cloud AI agents hands on your local machine — hardened, modular, injection-proof — plus an orchestrator for the local coding agents you already use
 
 ---
 
@@ -44,11 +44,13 @@ Notion board ──> Dispatcher Assistant (cloud, MCP connector)
 - **Build Bridge** — `plan` / `start` / `get_status` / `answer` / `cancel` / `merge`: durable, dispatcher-agnostic coding-agent orchestration (SQLite job store, FIFO queue, isolated git worktrees, question relay, heartbeat crash detection, gated `--no-ff` merges with a revert window)
 - **8 Master Tools** — Consolidated tool architecture for deep machine control
 - **Multi-Agent Parallelism** — Session-isolated state allows multiple AI models to work together
+- **19 Master Tools** — Consolidated tool architecture for deep machine control
+- **Two transports** — Legacy SSE (`/sse`) and modern Streamable HTTP (`/mcp`)
+- **Multi-Agent Parallelism** — Session-isolated state lets multiple models work together
 - **Ngrok HTTPS Tunneling** — Auto-tunnels localhost for cloud agent access
-- **Ripgrep-Powered Search** — Near-instant recursive search with error transparency
-- **Session-Aware Auditing** — Every action logged with session ID and CWD
-- **Safety & Guardrails** — Path sandboxing, command blocklist, feature toggles
-- **SSE Stability** — 15s heartbeats for rock-solid proxy connections
+- **Ripgrep-Powered Search** — Fast recursive search with graceful `grep`/`fast-glob` fallback
+- **Session-Aware Auditing** — Every action logged (with rotation) with session ID and CWD
+- **Safety & Guardrails** — Path sandboxing (symlink-aware), shell-free execution, feature toggles, kill switch
 
 ---
 
@@ -72,98 +74,49 @@ cp .env.example .env
 # Edit .env with your NGROK_AUTHTOKEN, BRIDGE_AUTH_TOKEN, and ALLOWED_DIRS
 ```
 
+`MCP_TOKEN` is **required** — the server refuses to open a tunnel without it (override for trusted local testing only via `ALLOW_UNAUTHENTICATED_TUNNEL=true`).
+
 ### Usage
 
 ```bash
-npm start
+npm start        # build + boot server + ngrok tunnel
+npm test         # run the unit tests (vitest)
+npm run lint     # eslint
+npm run typecheck
 ```
 
-Prints a secure connection URL + auth header — paste into your Notion Custom Agent's MCP settings.
+`npm start` prints two connection URLs — paste the one your agent supports:
+
+- **Streamable HTTP** → `<url>/mcp` (preferred for new clients)
+- **Legacy SSE** → `<url>/sse`
 
 ---
 
-## 🛠️ Tool Surface (8 Master Tools)
+## 🛠️ Tool Surface (19 Master Tools)
 
-### 📂 `fs-manage` — File System Operations
+Each tool is action-dispatched: pass an `action` plus the fields that action needs.
 
-| Action | Description |
-|--------|-------------|
-| `read` | Read text files with `limit` and `tail` support |
-| `read-media` | Read image/audio as base64 for multimodal LLMs |
-| `batch-read` | Read multiple files in one call |
-| `write` | Create/overwrite files with auto-parent directory creation |
-| `smart-edit` | Surgical find-and-replace edits |
-| `list` / `list-with-sizes` | List directory contents with metadata |
-| `tree` | Recursive JSON structure with exclusion patterns |
-| `file-info` | File metadata (size, timestamps, permissions) |
-| `move` / `copy` / `delete` / `mkdir` | File and directory management |
-
-### 🔍 `fs-search` — Codebase Search
-
-| Action | Description |
-|--------|-------------|
-| `regex-search` | Recursive regex search with context lines (`rg` backend) |
-| `file-search` | Glob-based file finding across the codebase |
-| `code-definitions` | Quick extraction of function/class/interface definitions |
-
-### ⚙️ `sys-manage` — macOS & System Control
-
-| Action | Description |
-|--------|-------------|
-| `exec` | Universal shell command execution (with CWD) |
-| `info` | OS version, CPU, RAM, disk, uptime |
-| `ps-list` / `ps-kill` | Process management and monitoring |
-| `list-apps` / `open-app` / `open-url` / `open-file` | macOS app control |
-| `clipboard-read` / `clipboard-write` | System clipboard access |
-| `screenshot` | Capture screen or windows |
-| `notification` / `say` | Notifications and text-to-speech |
-| `volume` / `brightness` | Audio and display control |
-| `caffeinate` / `lock-screen` | Power management |
-| `active-app` / `window-list` | Window awareness |
-
-### 📦 `git-manage` — Version Control
-
-| Action | Description |
-|--------|-------------|
-| `status` / `add` / `commit` / `push` / `pull` | Core git workflow |
-| `branch` / `log` / `diff` / `stash` / `merge` / `tag` | Branch management |
-| `raw` | Run any git command directly |
-
-### 🌐 `browser-manage` — Web Automation
-
-| Action | Description |
-|--------|-------------|
-| `navigate` | Open a URL in headless Puppeteer |
-| `click` / `type` | Interact with page elements |
-| `get-text` / `get-html` | Extract page content |
-| `screenshot-page` / `pdf` | Capture pages |
-| `evaluate` | Run arbitrary JavaScript |
-| `wait` | Wait for elements or conditions |
-
-### 🌐 `net-manage` — Network & Research
-
-| Action | Description |
-|--------|-------------|
-| `http-request` | REST client (GET/POST/PUT/DELETE) |
-| `download` | Download files to local filesystem |
-| `web-search` | Live search via DuckDuckGo |
-| `port-check` | Verify local service status |
-
-### 🎬 `media-manage` — Media Processing
-
-| Action | Description |
-|--------|-------------|
-| `transcode` | Video transcoding via FFmpeg |
-| `convert-image` | Image format conversion |
-| `extract-audio` | Extract audio from video |
-| `metadata` | Read media metadata via FFprobe |
-
-### 📄 `doc-manage` — Document Intelligence
-
-| Action | Description |
-|--------|-------------|
-| `pdf` / `docx` / `spreadsheet` / `csv` | Parse document contents |
-| `markdown-preview` | Preview Markdown rendering |
+| Tool | Purpose | Key actions |
+|------|---------|-------------|
+| `fs-manage` | Filesystem | read, read-media, batch-read, write, smart-edit, patch, list, list-with-sizes, tree, file-info, move, copy, delete, mkdir |
+| `fs-search` | Codebase search | regex-search, file-search, code-definitions |
+| `sys-manage` | System & macOS | exec, info, ps-list, ps-kill, list-apps, open-app/url/file, clipboard-read/write, screenshot, notification, say, volume, brightness, caffeinate, lock-screen, active-app, window-list, test-run, lint |
+| `git-manage` | Version control | status, add, commit, push, pull, branch, log, diff, stash, merge, tag, raw |
+| `media-manage` | FFmpeg/FFprobe | transcode, convert-image, extract-audio, metadata |
+| `doc-manage` | Documents | pdf, docx, spreadsheet, csv, markdown-preview |
+| `browser-manage` | Headless browser | navigate, click, type, get-text, get-html, screenshot-page, pdf, evaluate, wait |
+| `net-manage` | Network | http-request, download, web-search, port-check |
+| `task-manage` | Background jobs | run, status, logs, cancel, list |
+| `watch-manage` | FS watch / log tail | watch, poll, unwatch, list-watchers, tail-log |
+| `secret-manage` | macOS Keychain (off by default) | get, set, delete, list |
+| `archive-manage` | Archives | zip, unzip, tar, untar, list-contents |
+| `db-manage` | SQLite | query, execute, schema, list-tables |
+| `diff-manage` | Diff & patch | file-diff, dir-diff, apply-patch, three-way-merge |
+| `code-format` | Formatters | format, check, list-formatters |
+| `test-manage` | Structured tests | run, run-file, coverage |
+| `audit-manage` | Audit log explorer | tail, search, stats, session-history |
+| `env-manage` | `.env` files | read, set, unset, validate, diff |
+| `window-manage` | macOS windows | list, focus, resize, move, screenshot-window, applescript |
 
 ---
 
@@ -217,11 +170,16 @@ npm run build && ./scripts/install-service.sh   # bridge (+ ngrok tunnel service
 
 ## 🛡️ Security & Guardrails
 
-- **Path Isolation** — All operations validated against `ALLOWED_DIRS`
-- **Command Blocklist** — Destructive patterns (`rm -rf /`, etc.) intercepted
-- **Bearer Token Auth** — Every MCP request requires `BRIDGE_AUTH_TOKEN`
-- **Audit Logs** — Every tool execution recorded in `audit.log` with session ID
-- **Feature Toggles** — Disable write, shell, git, or media via `.env`
+- **Path isolation (symlink-aware)** — All file operations are validated against `ALLOWED_DIRS`. Paths are fully symlink-resolved, so a symlink inside an allowed directory that points outside it is rejected.
+- **Shell-free execution** — Tools invoke binaries via `execFile` with explicit argument vectors, so filenames/queries containing shell metacharacters cannot inject commands.
+- **Bearer token auth** — Every MCP request requires `MCP_TOKEN` in the `Authorization` header (constant-time comparison; never accepted as a query parameter).
+- **Kill switch** — Create `~/.mcp_kill` to block **all** tool calls (GET and POST) with a 503 until removed.
+- **Feature toggles** — Disable write, shell, git, media, browser, net, db, or keychain independently.
+- **Confirmation gate** — With `ENABLE_CONFIRMATION_GATE=true`, actions marked *dangerous* must be re-called with `confirm:true`.
+- **Tool allowlist** — `TOOLS=fs-manage,fs-search` registers only those tools (least privilege).
+- **Audit logs** — Every tool execution is recorded in `audit.log` (JSONL, auto-rotated) with session ID.
+
+> ⚠️ **Honest limitation:** the command blocklist (`rm -rf /`, `curl … | sh`, …) is a *tripwire*, not a boundary. Once `ENABLE_RUN_COMMAND` is on, the `sys-manage exec` and `task-manage` tools can run anything your user account can, anywhere on disk — `ALLOWED_DIRS` only sandboxes the structured file tools and the command working directory. For real containment, disable shell execution or scope `TOOLS`.
 
 ---
 
@@ -229,12 +187,17 @@ npm run build && ./scripts/install-service.sh   # bridge (+ ngrok tunnel service
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `8123` | Local MCP server port |
+| `PORT` | `8123` | Local MCP server port (shared by server and ngrok) |
 | `NGROK_DOMAIN` | — | Ngrok static domain (optional, for stable URLs) |
 | `NGROK_AUTHTOKEN` | — | From [dashboard.ngrok.com](https://dashboard.ngrok.com) |
 | `ALLOWED_DIRS` | `~/Documents` | Repo allowlist. Add via `--add-dir <path>` / `buildboard add-dir` or `allowed-dirs.txt` (hot-reloaded); remove/edit via the file only |
 | `COMMAND_TIMEOUT` | `30000` | Shell command timeout in ms |
 | `BRIDGE_AUTH_TOKEN` | — | **Required** bearer for the internet-exposed MCP endpoint (`MCP_TOKEN` legacy alias; `BRIDGE_ALLOW_NO_AUTH=true` for local-only testing) |
+| `CORS_ORIGINS` | — | Comma-separated allowlist; permissive if unset |
+| `ENABLE_SECRETS` | `false` | Keychain access (largest exfiltration surface) — off by default |
+| `TOOLS` | — | Optional least-privilege allowlist: only register these tools |
+| `MAX_EXEC_BUFFER` | `64 MB` | Child-process stdout/stderr buffer cap |
+| `AUDIT_LOG_MAX_BYTES` | `10 MB` | Audit log rotation threshold |
 | `ENABLE_WRITE_EDIT` | `true` | Allow file write/edit operations |
 | `ENABLE_RUN_COMMAND` | `true` | Allow shell command execution |
 | `ENABLE_GIT` | `true` | Allow git operations |
@@ -265,7 +228,7 @@ npm run build && ./scripts/install-service.sh   # bridge (+ ngrok tunnel service
 computer-access/
 ├── .env                    # Active config (secrets, gitignored)
 ├── .env.example            # Configuration template
-├── .gitignore
+├── .github/workflows/ci.yml
 ├── package.json
 ├── tsconfig.json
 ├── providers.json          # Coding-agent CLI registry (auto/accept-edits/plan/resume postures)
@@ -278,7 +241,11 @@ computer-access/
 ├── tests/                  # bridge-smoke.ts (157 assertions) · service-smoke.sh
 └── src/
     ├── start.ts            # Ngrok boot orchestrator (embedded-tunnel mode)
-    ├── server.ts           # MCP server: 19 master tools + 6 bridge tools, auth, allowlist
+    ├── server.ts           # Composition root: transports (SSE + /mcp), auth, guarded registrar
+    ├── config.ts           # Environment parsing + allowed-dirs machinery (single source of truth)
+    ├── security.ts         # Symlink-aware sandbox, blocklists, confirmation gate
+    ├── audit.ts / exec.ts / runtime.ts   # Rotating audit log · shell-free exec · shared state
+    ├── tools/              # One module per master tool (19) + bridgeTools.ts (the 6 bridge tools)
     ├── bridge.ts           # Job orchestration: dispatch, queue, sessions, recovery, sweeps
     ├── jobs.ts             # Durable SQLite job store (self-healing schema)
     ├── providers.ts        # Provider registry loader/validator
@@ -291,7 +258,8 @@ computer-access/
 
 ## 📋 Changelog
 
-### v1.1 — 2026-07-06
+### v2.0 — 2026-07-06
+**The build bridge (dispatcher-agnostic orchestration):**
 - **Build bridge**: `plan` / `start` / `get_status` / `answer` / `cancel` / `merge` MCP tools — a generic, dispatcher-blind build executor (vocabulary: `jobId + repoPath + agent + mode + prompt`; states: `planning/planned/queued/running/awaiting_input/paused/in_review/failed/merged/cancelled`). All calls return immediately; nothing blocks on a slow run
 - Durable SQLite job store with a self-healing schema guard, FIFO **queueing** past the concurrency cap (drained at boot, sweep, and wake), and per-job log files
 - Provider registry (`providers.json`): per-agent **auto / accept-edits / plan / resume** postures for claude-code, codex, opencode, antigravity-agy, grok-build, github-copilot-cli; plan modes headless / oneshot (generated-file capture) / interactive (pty-driven TUI) with thin-plan escalation and last-resort `PLAN_FALLBACK_AGENT`
@@ -299,12 +267,15 @@ computer-access/
 - Isolated per-job git worktrees under `WORKTREE_ROOT`, branch `job/<jobId>` kept through a configurable revert window; empty diffs finish `in_review` with an empty `diffStat`; merge guard ignores untracked files; push failures pause with the commit kept local (`localOnly`)
 - **Always-on service**: launchd LaunchAgents (bridge + ngrok reserved-domain tunnel) with the `buildboard` CLI, power assertion held only while jobs run, monotonic-clock wake detection → tunnel check / reconcile / queue drain, and pid-liveness recovery (reattach alive orphans; `RESUME_STRATEGY` resume/rerun/rework via per-provider `--continue` templates)
 - **Hardening**: `BRIDGE_AUTH_TOKEN` required on the internet-exposed endpoint; `ALLOWED_DIRS` defaults to `~/Documents` with non-interactive `--add-dir` and a hot-reloaded `allowed-dirs.txt` (removals file-only); launch-context-proof PATH augmentation + boot agent preflight; user-authorized package installs (`ALLOW_PACKAGE_INSTALLS`); heartbeat stale-kill on stdout+stderr; break-glass `ENABLE_CONFIRMATION_GATE`
+**The hardened core (security & structure):**
+- **Security:** shell-free execution across all tools (execFile + argv), symlink-aware path sandbox, constant-time token check (header only), kill switch on POST routes, keychain off by default, tunnel refuses to start without `MCP_TOKEN`, confirmation gate wired into dispatch.
+- **Robustness:** JSON body parsing (webhook tool names, pre-parsed transport bodies), single `/health` route, `smart-edit` uniqueness check without `$`-corruption, `patch` via system `patch(1)`, depth-capped/symlink-safe `tree`, background-task buffer caps + eviction + process-group kill, size caps on media reads, browser crash recovery, larger exec buffer.
+- **Structure:** extracted `config`/`security`/`exec`/`audit`/`runtime` modules and split the 19 tool handlers into one module each under `src/tools/` (server.ts is now a ~350-line composition root); added vitest tests, eslint, and CI.
+- **Enhancements:** Streamable HTTP transport (`/mcp`) alongside SSE, audit-log rotation, per-tool allowlist (`TOOLS`).
+- **Dependencies:** replaced abandoned `xlsx@0.18.5` (ReDoS / prototype-pollution CVEs) with the vendor-distributed SheetJS `0.20.3` (same API, patched); dropped dead `@types/axios` and `@types/express-rate-limit`.
 
 ### v1.0 — 2026-04-24
-- Standardized terminal print pattern (consistent with browser-access)
-- Added tunnel health check monitoring (30s interval)
-- Renamed from "Agent Smith" to "Computer Access"
-- Updated ngrok boot message format
+- Standardized terminal print pattern; tunnel health check monitoring; renamed to "Computer Access".
 
 ---
 
