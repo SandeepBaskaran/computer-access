@@ -26,7 +26,7 @@
     "mime-types": "^3.0.2",
     "pdf-parse": "^2.4.5",
     "puppeteer": "^24.40.0",
-    "xlsx": "^0.18.5",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zod": "^3.24.1"
   },
   "devDependencies": {
@@ -40,5 +40,11 @@
     "@types/pdf-parse": "^1.1.5",
     "tsx": "^4.7.0",
     "typescript": "^5.7.3"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.9.0": true,
+    "esbuild@0.27.7": true,
+    "fsevents@2.3.3": true,
+    "puppeteer@24.40.0": true
   }
 }
