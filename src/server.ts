@@ -22,9 +22,8 @@ import { parse as csvParse } from "csv-parse/sync";
 import fg from "fast-glob";
 import { randomUUID } from "crypto";
 import Database from "better-sqlite3";
-import { createBridge, DEFAULT_BOARD_MAP, BoardMap } from "./bridge.js";
-import { createNotionBoardClient, DEFAULT_PROP_MAP, BoardClient, BoardPropMap } from "./notion.js";
-import { readFileSync } from "fs";
+import { createBridge } from "./bridge.js";
+import { readFileSync, appendFileSync } from "fs";
 
 // ── Environment Loading ─────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -33,13 +32,64 @@ dotenv.config({ path: path.resolve(__dirname, "../.env") });
 const execPromise = promisify(exec);
 
 // ── Configuration ───────────────────────────────────────────
+// ALLOWED_DIRS: env + argv + allowed-dirs.txt, defaulting to ~/Documents.
+// Additions are non-interactive (`--add-dir <path>` or the file); removals and
+// edits happen ONLY by editing the file — no command can shrink the allowlist.
+const ALLOWED_DIRS_FILE = path.resolve(__dirname, "../allowed-dirs.txt");
+
+function readAllowedDirsFile(): string[] {
+  try {
+    return readFileSync(ALLOWED_DIRS_FILE, "utf-8")
+      .split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+  } catch { return []; }
+}
+
 const envDirs = (process.env.ALLOWED_DIRS || "").split(",").filter(Boolean);
 const argDirs = process.argv.slice(2).filter(arg => !arg.startsWith("-"));
 
-const ALLOWED_DIRS = (envDirs.length > 0 ? envDirs : argDirs).map(d => path.resolve(d));
+// Non-interactive add: `node dist/server.js --add-dir <path>` appends to the file and exits.
+{
+  const addIdx = process.argv.indexOf("--add-dir");
+  if (addIdx !== -1) {
+    const dir = process.argv[addIdx + 1];
+    if (!dir) { console.error("usage: --add-dir <absolute-path>"); process.exit(1); }
+    const resolved = path.resolve(dir.startsWith("~") ? path.join(os.homedir(), dir.slice(1)) : dir);
+    const current = readAllowedDirsFile();
+    if (current.includes(resolved)) {
+      console.error(`already allowed: ${resolved}`);
+    } else {
+      appendFileSync(ALLOWED_DIRS_FILE, (current.length === 0 ? "# One allowed directory per line. Edit this file to remove or change entries.\n" : "") + resolved + "\n");
+      console.error(`added to allowed dirs: ${resolved}`);
+    }
+    process.exit(0);
+  }
+}
+
+let ALLOWED_DIRS = [...new Set([...envDirs, ...argDirs, ...readAllowedDirsFile()])].map(d =>
+  path.resolve(d.startsWith("~") ? path.join(os.homedir(), d.slice(1)) : d));
+let allowedDirsDefaulted = false;
+if (ALLOWED_DIRS.length === 0) {
+  ALLOWED_DIRS = [path.join(os.homedir(), "Documents")];
+  allowedDirsDefaulted = true;
+}
+// Hot-reload additions when allowed-dirs.txt changes (removals apply too — the file is authoritative for its own entries).
+try {
+  fsWatch(path.dirname(ALLOWED_DIRS_FILE), (_e, f) => {
+    if (f !== path.basename(ALLOWED_DIRS_FILE)) return;
+    const fresh = [...new Set([...envDirs, ...argDirs, ...readAllowedDirsFile()])].map(d =>
+      path.resolve(d.startsWith("~") ? path.join(os.homedir(), d.slice(1)) : d));
+    if (fresh.length > 0) {
+      ALLOWED_DIRS = fresh;
+      allowedDirsDefaulted = false;
+      console.error(`[BRIDGE] allowed-dirs.txt reloaded — ${ALLOWED_DIRS.length} allowed dir(s).`);
+    }
+  });
+} catch { /* watcher is best-effort */ }
+
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const COMMAND_TIMEOUT = parseInt(process.env.COMMAND_TIMEOUT || "30000", 10);
-const MCP_TOKEN = process.env.MCP_TOKEN;
+// Generic bearer auth for the internet-exposed MCP endpoint. MCP_TOKEN is the legacy alias.
+const MCP_TOKEN = process.env.BRIDGE_AUTH_TOKEN || process.env.MCP_TOKEN;
 const SESSION_IDLE_TTL_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || String(30 * 60 * 1000), 10);
 const SESSION_MAX_TTL_MS = parseInt(process.env.SESSION_MAX_TTL_MS || String(8 * 60 * 60 * 1000), 10);
 const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
@@ -61,9 +111,9 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "200", 10);
 
-// ── Build Board Bridge Configuration ────────────────────────
-const DEFAULT_PROVIDER = process.env.DEFAULT_PROVIDER || "claude-code";
-const rawWorktreeRoot = process.env.WORKTREE_ROOT || path.join(os.homedir(), ".build-board", "worktrees");
+// ── Build Bridge Configuration ──────────────────────────────
+const DEFAULT_PROVIDER = process.env.DEFAULT_AGENT || process.env.DEFAULT_PROVIDER || "claude-code";
+const rawWorktreeRoot = process.env.WORKTREE_ROOT || path.join(os.homedir(), ".bridge", "worktrees");
 const WORKTREE_ROOT = rawWorktreeRoot.startsWith("~")
   ? path.join(os.homedir(), rawWorktreeRoot.slice(1))
   : path.resolve(rawWorktreeRoot);
@@ -76,74 +126,11 @@ const HOLD_RETRY_MS = parseInt(process.env.HOLD_RETRY_MS || String(30 * 60 * 100
 const PLAN_FALLBACK_AGENT = process.env.PLAN_FALLBACK_AGENT ?? "claude-code";
 const PLAN_MIN_CHARS = parseInt(process.env.PLAN_MIN_CHARS || "200", 10);
 const PLAN_IDLE_MS = parseInt(process.env.PLAN_IDLE_MS || "20000", 10);
-const SELF_SCAN_INTERVAL_MS = parseInt(process.env.SELF_SCAN_INTERVAL_MS || "90000", 10);
 const WAKE_GAP_MS = parseInt(process.env.WAKE_GAP_MS || "120000", 10);
 const RESUME_STRATEGY = (["resume", "rerun", "rework"].includes(process.env.RESUME_STRATEGY || "") ? process.env.RESUME_STRATEGY : "resume") as "resume" | "rerun" | "rework";
 const TUNNEL_API_URL = process.env.TUNNEL_API_URL || "http://127.0.0.1:4040/api/tunnels";
 const ALLOW_PACKAGE_INSTALLS = process.env.ALLOW_PACKAGE_INSTALLS !== "false"; // user-authorized installs, default ON
 const DEFAULT_MODE = (process.env.DEFAULT_MODE === "accept_edits" ? "accept_edits" : "auto") as "auto" | "accept_edits";
-
-// ── board-map.json: property/option names the bridge writes — never hard-coded in logic ──
-function loadBoardMap(): { map: BoardMap; props: BoardPropMap } {
-  try {
-    const raw = JSON.parse(readFileSync(path.join(__dirname, "../board-map.json"), "utf-8"));
-    const map: BoardMap = {
-      statusOptions: { ...DEFAULT_BOARD_MAP.statusOptions, ...(raw.statusOptions ?? {}) },
-      modeOptions: { ...DEFAULT_BOARD_MAP.modeOptions, ...(raw.modeOptions ?? {}) },
-    };
-    const p = raw.properties ?? {};
-    const props: BoardPropMap = {
-      status: p.status ?? DEFAULT_PROP_MAP.status,
-      taskId: p.taskId ?? DEFAULT_PROP_MAP.taskId,
-      repo: p.repoPath ?? DEFAULT_PROP_MAP.repo,
-      agent: p.codingAgent ?? DEFAULT_PROP_MAP.agent,
-      brief: p.brief ?? DEFAULT_PROP_MAP.brief,
-      verify: p.verifyCommand ?? DEFAULT_PROP_MAP.verify,
-      mode: p.mode ?? DEFAULT_PROP_MAP.mode,
-      project: p.project ?? DEFAULT_PROP_MAP.project,
-    };
-    return { map, props };
-  } catch (e: any) {
-    console.error(`[BRIDGE] board-map.json not loaded (${e.message}) — using default names.`);
-    return { map: DEFAULT_BOARD_MAP, props: DEFAULT_PROP_MAP };
-  }
-}
-const { map: BOARD_MAP, props: BOARD_PROPS } = loadBoardMap();
-
-// ── Self-scan board access (token via Keychain, never logged) ──
-function resolveSecretSync(value: string): string {
-  if (!value.startsWith("keychain:")) return value;
-  try {
-    return execFileSync("security", ["find-generic-password", "-s", value.slice("keychain:".length), "-w"], { encoding: "utf-8" }).trim();
-  } catch {
-    console.error(`[BRIDGE] Keychain lookup failed for '${value}' — self-scan disabled.`);
-    return "";
-  }
-}
-
-let boardClient: BoardClient | undefined;
-{
-  const rawToken = process.env.NOTION_TOKEN || "";
-  const dataSourceId = process.env.BOARD_DATA_SOURCE_ID || "";
-  if (rawToken && dataSourceId) {
-    const token = resolveSecretSync(rawToken);
-    if (token) {
-      boardClient = createNotionBoardClient(token, dataSourceId, {
-        status: process.env.BOARD_PROP_STATUS || BOARD_PROPS.status,
-        taskId: process.env.BOARD_PROP_TASK_ID || BOARD_PROPS.taskId,
-        repo: process.env.BOARD_PROP_REPO || BOARD_PROPS.repo,
-        agent: process.env.BOARD_PROP_AGENT || BOARD_PROPS.agent,
-        brief: process.env.BOARD_PROP_BRIEF || BOARD_PROPS.brief,
-        verify: process.env.BOARD_PROP_VERIFY || BOARD_PROPS.verify,
-        mode: process.env.BOARD_PROP_MODE || BOARD_PROPS.mode,
-        project: process.env.BOARD_PROP_PROJECT || BOARD_PROPS.project,
-      });
-      console.error("[BRIDGE] Board self-scan enabled.");
-    }
-  } else {
-    console.error("[BRIDGE] NOTION_TOKEN/BOARD_DATA_SOURCE_ID not set — self-scan disabled; the cloud agent pulse is the only dispatcher.");
-  }
-}
 
 // Tunnel liveness via the ngrok agent's local API (works for the launchd
 // tunnel service; the embedded start.ts tunnel has its own health check).
@@ -228,10 +215,22 @@ async function auditLog(tool: string, input: any, status: "SUCCESS" | "BLOCKED" 
   await appendFile(path.join(__dirname, "../audit.log"), entry).catch(e => console.error("Audit log failed:", e));
 }
 
-if (ALLOWED_DIRS.length === 0) {
-  console.error("CRITICAL ERROR: 'ALLOWED_DIRS' environment variable is missing or empty.");
+// Startup notice at every boot: where the sandbox is, and the non-interactive
+// way to widen it. Removing/editing entries is done ONLY by editing the file.
+if (allowedDirsDefaulted) {
+  console.error(`[BRIDGE] ALLOWED_DIRS not configured — defaulting to ${ALLOWED_DIRS[0]}`);
+}
+console.error(`[BRIDGE] Allowed directories (${ALLOWED_DIRS.length}): ${ALLOWED_DIRS.join(", ")}`);
+console.error(`[BRIDGE]   add one:    node dist/server.js --add-dir /absolute/path   (also available via the service CLI: add-dir)`);
+console.error(`[BRIDGE]   remove/edit: edit ${ALLOWED_DIRS_FILE} (file is the source of truth; changes hot-reload)`);
+
+// Generic bearer auth is REQUIRED — this endpoint is internet-exposed via the tunnel.
+if (!MCP_TOKEN && process.env.BRIDGE_ALLOW_NO_AUTH !== "true") {
+  console.error("CRITICAL ERROR: BRIDGE_AUTH_TOKEN is not set. The MCP endpoint is internet-exposed and must be authenticated.");
+  console.error("Fix:  set BRIDGE_AUTH_TOKEN=<random-secret> in .env   (or BRIDGE_ALLOW_NO_AUTH=true for local-only testing)");
   process.exit(1);
 }
+if (!MCP_TOKEN) console.error("[BRIDGE] WARNING: running WITHOUT auth (BRIDGE_ALLOW_NO_AUTH=true) — local testing only.");
 
 // ── Security: Path Validation ───────────────────────────────
 async function expandAndResolve(filePath: string): Promise<string> {
@@ -273,10 +272,10 @@ async function isPathAllowed(filePath: string): Promise<boolean> {
   }
 }
 
-// ── Build Board Bridge ──────────────────────────────────────
-// Durable task orchestration (start-task / get-job-status / merge-task).
-// Confirmation gate is break-glass: ON means merge-task refuses outright —
-// the board's Approved column is the real gate.
+// ── Build Bridge ────────────────────────────────────────────
+// Durable, dispatcher-agnostic job orchestration (start / plan / get_status /
+// answer / merge / cancel). Confirmation gate is break-glass: ON means merge
+// refuses outright — approval flows live with whichever tool dispatches work.
 const bridge = createBridge({
   dataDir: path.join(__dirname, "../data"),
   registryPath: path.join(__dirname, "../providers.json"),
@@ -292,14 +291,10 @@ const bridge = createBridge({
   planMinChars: PLAN_MIN_CHARS,
   planIdleMs: PLAN_IDLE_MS,
   resumeStrategy: RESUME_STRATEGY,
-  selfScanIntervalMs: SELF_SCAN_INTERVAL_MS,
   wakeGapMs: WAKE_GAP_MS,
-  boardClient,
   tunnelCheck: defaultTunnelCheck,
   defaultMode: DEFAULT_MODE,
   allowPackageInstalls: ALLOW_PACKAGE_INSTALLS,
-  boardMap: BOARD_MAP,
-  boardId: process.env.BOARD_DATA_SOURCE_ID || undefined,
   confirmationGateEnabled: () => requiresConfirmation("bridge-merge", "merge", {}).required,
   isPathAllowed,
 });
@@ -2003,136 +1998,136 @@ function createMcpServer(sessionId: string) {
   });
 
   /**
-   * ── Build Board Tool 1: start-task ─────────────────────────
+   * ── Bridge Tool 1: start ───────────────────────────────────
    */
-  server.registerTool("start-task", {
-    title: "Build Board: Start Task",
-    description: "Dispatch a board task to a local coding-agent CLI. Creates an isolated git worktree on branch task/<taskId>, runs the provider asynchronously, and returns immediately. On success the branch is committed, pushed, and a PR/compare URL is recorded (state: in_review). Re-calling for a running task returns alreadyRunning; re-calling for a failed/in_review task is the Rework path (same branch/worktree, new brief).",
+  server.registerTool("start", {
+    title: "Bridge: Start Build Job",
+    description: "Dispatch a build job to a local coding-agent CLI. Creates an isolated git worktree on branch job/<jobId> (or the given branch), runs the agent asynchronously, and returns immediately. On success the branch is committed, pushed, and a PR/compare URL is recorded (state: in_review). Structured returns: alreadyRunning (idempotent on jobId), queued (capacity full — dispatched FIFO as slots free), invalidRepo, awaiting_input (directory has no git repo — reply via `answer` to authorize `git init`). Re-calling for a failed/in_review job re-runs on the same branch/worktree with the new prompt.",
     inputSchema: {
-      taskId: z.string().describe("Short board task ID (e.g. '102') — becomes branch task/<id>"),
-      pageId: z.string().describe("Notion page UUID — the idempotency/correlation key"),
-      repoPath: z.string().describe("Absolute path to the target git repository (must be inside ALLOWED_DIRS)"),
-      brief: z.string().describe("The work brief passed to the coding agent"),
-      codingAgent: z.string().optional().describe(`Provider from providers.json (default: ${DEFAULT_PROVIDER})`),
-      verifyCommand: z.string().optional().describe("Shell command run in the worktree after the agent finishes; non-zero exit fails the task. Falls back to .buildboard.json's verifyCommand, then skips."),
-      mode: z.enum(["auto", "accept_edits"]).optional().describe(`Execution posture from the card's Mode select: auto = full autonomy (skip-permissions), accept_edits = supervised (edits auto-apply; shell/installs/deletes pause and the question is relayed to the board via hold(needs_input) → answer-task). Default: ${DEFAULT_MODE}`)
+      jobId: z.string().describe("Opaque caller-supplied id — the idempotency/dedup key; also derives branch job/<jobId>"),
+      repoPath: z.string().describe("Absolute path to the target directory (must be inside ALLOWED_DIRS)"),
+      prompt: z.string().describe("Natural-language work description passed to the coding agent"),
+      agent: z.string().optional().describe(`Local agent from providers.json (default: ${DEFAULT_PROVIDER})`),
+      mode: z.enum(["auto", "accept_edits"]).optional().describe(`Execution posture: auto = full autonomy (skip-permissions), accept_edits = supervised (edits auto-apply; shell/installs/deletes pause → awaiting_input → answer). Default: ${DEFAULT_MODE}`),
+      verifyCommand: z.string().optional().describe("Shell command run in the worktree after the agent finishes; non-zero exit fails the job. Falls back to the repo's .bridge.json verifyCommand, then skips."),
+      branch: z.string().optional().describe("Branch to work on (default: job/<jobId>)")
     }
   }, async (params) => {
     try {
       const result = await bridge.startTask(params);
-      await auditLog("start-task", { taskId: params.taskId, pageId: params.pageId, provider: params.codingAgent }, "SUCCESS", sessionId, undefined, params.repoPath);
+      await auditLog("start", { jobId: params.jobId, agent: params.agent }, "SUCCESS", sessionId, undefined, params.repoPath);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (e: any) {
-      await auditLog("start-task", { taskId: params.taskId, pageId: params.pageId }, "ERROR", sessionId, e.message, params.repoPath);
-      return { content: [{ type: "text" as const, text: `Start Task Error: ${e.message}` }] };
+      await auditLog("start", { jobId: params.jobId }, "ERROR", sessionId, e.message, params.repoPath);
+      return { content: [{ type: "text" as const, text: `Start Error: ${e.message}` }] };
     }
   });
 
   /**
-   * ── Build Board Tool: plan-task ────────────────────────────
+   * ── Bridge Tool 2: plan ────────────────────────────────────
    */
-  server.registerTool("plan-task", {
-    title: "Build Board: Plan Task",
-    description: "Dispatch a READ-ONLY plan job — no branch, no worktree, no writes — and return IMMEDIATELY ({started:true}). Never blocks on a slow plan. Poll get-job-status: state 'planning' → still running; 'planned' → result in the `plan` field (+ needsInput/question when the agent asked something). If the card's codingAgent has no plan mode, the plan runs via PLAN_FALLBACK_AGENT (read-only) while the card's agent stays the build provider — the plan text says who planned it. Structured returns: alreadyPlanning, capacityExceeded, invalidRepo, planUnsupported (only when neither the card's agent nor a valid fallback can plan — never a write-mode fallback).",
+  server.registerTool("plan", {
+    title: "Bridge: Plan Job",
+    description: "Dispatch a READ-ONLY plan job — no branch, no worktree, no writes — and return IMMEDIATELY ({started:true}). Never blocks on a slow plan. Poll get_status: 'planning' → still running; 'planned' → result in the `plan` field (+ needsInput/question when the agent asked something). If the chosen agent has no plan mode, the plan runs via PLAN_FALLBACK_AGENT (read-only) while the chosen agent stays the build agent — the plan text says who planned it. Structured returns: alreadyPlanning, queued, invalidRepo, planUnsupported (planSupported:false only when neither the agent nor a valid fallback can plan).",
     inputSchema: {
-      taskId: z.string().describe("Short board task ID"),
-      pageId: z.string().optional().describe("Notion page UUID (correlation only; plans are stateless)"),
-      repoPath: z.string().describe("Absolute path to the target git repository (must be inside ALLOWED_DIRS)"),
-      brief: z.string().describe("What to plan"),
-      codingAgent: z.string().optional().describe(`Provider from providers.json (default: ${DEFAULT_PROVIDER})`),
-      complex: z.boolean().optional().describe("Mark the task complex: skip the cheap one-shot pass and go straight to an interactive plan session when the provider supports one")
+      jobId: z.string().describe("Opaque caller-supplied id — the idempotency/dedup key"),
+      repoPath: z.string().describe("Absolute path to the target directory (must be inside ALLOWED_DIRS)"),
+      prompt: z.string().describe("What to plan"),
+      agent: z.string().optional().describe(`Local agent from providers.json (default: ${DEFAULT_PROVIDER})`),
+      complex: z.boolean().optional().describe("Skip the cheap one-shot pass and go straight to an interactive plan session when the agent supports one")
     }
   }, async (params) => {
     try {
       const result = await bridge.planTask(params);
-      await auditLog("plan-task", { taskId: params.taskId, provider: params.codingAgent }, result.error ? "BLOCKED" : "SUCCESS", sessionId, result.error, params.repoPath);
+      await auditLog("plan", { jobId: params.jobId, agent: params.agent }, result.error ? "BLOCKED" : "SUCCESS", sessionId, result.error, params.repoPath);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (e: any) {
-      await auditLog("plan-task", { taskId: params.taskId }, "ERROR", sessionId, e.message, params.repoPath);
-      return { content: [{ type: "text" as const, text: `Plan Task Error: ${e.message}` }] };
+      await auditLog("plan", { jobId: params.jobId }, "ERROR", sessionId, e.message, params.repoPath);
+      return { content: [{ type: "text" as const, text: `Plan Error: ${e.message}` }] };
     }
   });
 
   /**
-   * ── Build Board Tool: answer-task ──────────────────────────
+   * ── Bridge Tool 3: get_status ──────────────────────────────
    */
-  server.registerTool("answer-task", {
-    title: "Build Board: Answer Task",
-    description: "Relay a human's answer into a job paused on hold(needs_input). If the interactive plan session is still alive, the answer goes straight into the CLI; otherwise the answer is folded into the brief and the job cleanly re-runs. Loop: get-job-status question → post as board comment → human replies → answer-task → repeat until planned.",
+  server.registerTool("get_status", {
+    title: "Bridge: Job Status",
+    description: "Durable job state, always as an ARRAY. With jobId: one entry with full detail including a log excerpt. Without: the 50 most recent jobs. States: planning | planned | queued | running | awaiting_input (see `question`) | paused (see `pausedReason`: quota auto-retries; session/blocked need a human) | in_review (see prUrl/branchUrl/diffStat) | failed | merged | cancelled. Survives bridge restarts.",
     inputSchema: {
-      taskId: z.string().describe("Board task ID of the held job"),
-      answer: z.string().describe("The human's reply to the job's `question`")
+      jobId: z.string().optional().describe("Job id; omit to list recent jobs")
     }
-  }, async ({ taskId, answer }) => {
+  }, async ({ jobId }) => {
     try {
-      const result = await bridge.answerTask(taskId, answer);
-      await auditLog("answer-task", { taskId }, result.resumed ? "SUCCESS" : "BLOCKED", sessionId, result.error ?? result.message);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      const result = await bridge.getJobStatus(jobId);
+      const arr = Array.isArray(result?.jobs) ? result.jobs : [result];
+      await auditLog("get_status", { jobId }, "SUCCESS", sessionId);
+      return { content: [{ type: "text" as const, text: JSON.stringify(arr, null, 2) }] };
     } catch (e: any) {
-      await auditLog("answer-task", { taskId }, "ERROR", sessionId, e.message);
-      return { content: [{ type: "text" as const, text: `Answer Task Error: ${e.message}` }] };
+      await auditLog("get_status", { jobId }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Status Error: ${e.message}` }] };
     }
   });
 
   /**
-   * ── Build Board Tool: cancel-task ──────────────────────────
+   * ── Bridge Tool 4: answer ──────────────────────────────────
    */
-  server.registerTool("cancel-task", {
-    title: "Build Board: Cancel Task",
-    description: "Cancel a running or held job: kills the provider process, removes the worktree, KEEPS the branch (work done so far stays on task/<id>). Re-dispatching later with start-task resumes on the same branch.",
+  server.registerTool("answer", {
+    title: "Bridge: Answer Job Question",
+    description: "Relay a reply into a job in awaiting_input. A live interactive session gets the answer written into its pty; a dead session (or headless question, or a pending git-init authorization) re-runs cleanly with the answer applied. Loop until planned/in_review.",
     inputSchema: {
-      taskId: z.string().describe("Board task ID of the job to cancel")
+      jobId: z.string().describe("Job id of the waiting job"),
+      answer: z.string().describe("The reply to the job's `question`")
     }
-  }, async ({ taskId }) => {
+  }, async ({ jobId, answer }) => {
     try {
-      const result = await bridge.cancelTask(taskId);
-      await auditLog("cancel-task", { taskId }, result.cancelled ? "SUCCESS" : "BLOCKED", sessionId, result.error ?? result.message);
+      const result = await bridge.answerTask(jobId, answer);
+      await auditLog("answer", { jobId }, result.accepted ? "SUCCESS" : "BLOCKED", sessionId, result.error ?? result.message);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (e: any) {
-      await auditLog("cancel-task", { taskId }, "ERROR", sessionId, e.message);
-      return { content: [{ type: "text" as const, text: `Cancel Task Error: ${e.message}` }] };
+      await auditLog("answer", { jobId }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Answer Error: ${e.message}` }] };
     }
   });
 
   /**
-   * ── Build Board Tool 2: get-job-status ─────────────────────
+   * ── Bridge Tool 5: cancel ──────────────────────────────────
    */
-  server.registerTool("get-job-status", {
-    title: "Build Board: Job Status",
-    description: "Report the durable state of bridge jobs. With taskId: full detail for one job including a log excerpt (post it as a board comment). Without: the 50 most recent jobs. State survives bridge restarts.",
+  server.registerTool("cancel", {
+    title: "Bridge: Cancel Job",
+    description: "Cancel a running/queued/waiting job: kills the agent process, removes the worktree, KEEPS the branch. Re-dispatching later with `start` resumes on the same branch.",
     inputSchema: {
-      taskId: z.string().optional().describe("Board task ID or Notion page UUID; omit to list recent jobs")
+      jobId: z.string().describe("Job id to cancel")
     }
-  }, async ({ taskId }) => {
+  }, async ({ jobId }) => {
     try {
-      const result = await bridge.getJobStatus(taskId);
-      await auditLog("get-job-status", { taskId }, "SUCCESS", sessionId);
+      const result = await bridge.cancelTask(jobId);
+      await auditLog("cancel", { jobId }, result.cancelled ? "SUCCESS" : "BLOCKED", sessionId, result.error ?? result.message);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (e: any) {
-      await auditLog("get-job-status", { taskId }, "ERROR", sessionId, e.message);
-      return { content: [{ type: "text" as const, text: `Job Status Error: ${e.message}` }] };
+      await auditLog("cancel", { jobId }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Cancel Error: ${e.message}` }] };
     }
   });
 
   /**
-   * ── Build Board Tool 3: merge-task ─────────────────────────
+   * ── Bridge Tool 6: merge ───────────────────────────────────
    */
-  server.registerTool("merge-task", {
-    title: "Build Board: Merge Task",
-    description: "Merge an approved task into main with --no-ff and push. Refuses unless the job is in_review and the repo's working tree is clean. The branch is KEPT for the revert window; the worktree is removed. On conflict returns {merged:false, conflict:true} and keeps everything intact (move the card to Rework). action:'revert' reverts a merged task's merge commit within the revert window (manual/operator use — not part of the board lifecycle).",
+  server.registerTool("merge", {
+    title: "Bridge: Merge Job",
+    description: "Merge a reviewed job into the default branch with --no-ff and push. Refuses unless the job is in_review and the repo's working tree is clean. The branch is KEPT for the revert window; the worktree is removed. On conflict returns {merged:false, conflict:true} with everything intact. action:'revert' reverts a merged job's merge commit within the revert window (operator use).",
     inputSchema: {
-      taskId: z.string().describe("Board task ID of the job to merge"),
+      jobId: z.string().describe("Job id to merge"),
       action: z.enum(["merge", "revert"]).optional().describe("Default: merge")
     }
-  }, async ({ taskId, action }) => {
+  }, async ({ jobId, action }) => {
     try {
-      const result = await bridge.mergeTask(taskId, action ?? "merge");
+      const result = await bridge.mergeTask(jobId, action ?? "merge");
       const status = result.merged || result.reverted ? "SUCCESS" : "BLOCKED";
-      await auditLog("merge-task", { taskId, action: action ?? "merge" }, status, sessionId, result.error ?? result.message);
+      await auditLog("merge", { jobId, action: action ?? "merge" }, status, sessionId, result.error ?? result.message);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (e: any) {
-      await auditLog("merge-task", { taskId, action: action ?? "merge" }, "ERROR", sessionId, e.message);
-      return { content: [{ type: "text" as const, text: `Merge Task Error: ${e.message}` }] };
+      await auditLog("merge", { jobId, action: action ?? "merge" }, "ERROR", sessionId, e.message);
+      return { content: [{ type: "text" as const, text: `Merge Error: ${e.message}` }] };
     }
   });
 

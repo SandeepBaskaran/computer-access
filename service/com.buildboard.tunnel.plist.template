@@ -18,9 +18,9 @@
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
-  <string>__HOME__/.build-board/logs/tunnel.out.log</string>
+  <string>__HOME__/.bridge/logs/tunnel.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/.build-board/logs/tunnel.err.log</string>
+  <string>__HOME__/.bridge/logs/tunnel.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>

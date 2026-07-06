@@ -8,7 +8,7 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${DEST:-$HOME/Library/LaunchAgents}"
-LOG_DIR="$HOME/.build-board/logs"
+LOG_DIR="$HOME/.bridge/logs"
 NODE_BIN="$(command -v node || true)"
 NGROK_BIN="$(command -v ngrok || true)"
 PORT="$(grep -E '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"

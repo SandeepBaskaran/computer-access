@@ -18,9 +18,9 @@
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
-  <string>__HOME__/.build-board/logs/bridge.out.log</string>
+  <string>__HOME__/.bridge/logs/bridge.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/.build-board/logs/bridge.err.log</string>
+  <string>__HOME__/.bridge/logs/bridge.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>

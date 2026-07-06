@@ -25,3 +25,6 @@ permissions.json
 .vscode/
 .idea/
 .claude/
+
+# Local allowlist additions (machine-specific)
+allowed-dirs.txt

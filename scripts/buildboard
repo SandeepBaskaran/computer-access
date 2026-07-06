@@ -9,7 +9,7 @@ set -euo pipefail
 LABEL="com.buildboard.bridge"
 TUNNEL_LABEL="com.buildboard.tunnel"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="$HOME/.build-board/logs"
+LOG_DIR="$HOME/.bridge/logs"
 UID_N="$(id -u)"
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="$(grep -E '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 || true)"
@@ -36,8 +36,13 @@ case "${1:-}" in
   logs)
     tail -n "${2:-50}" -f "$LOG_DIR/bridge.err.log"
     ;;
+  add-dir)
+    # Non-interactive allowlist addition. Removal/editing: edit allowed-dirs.txt only.
+    [ -n "${2:-}" ] || { echo "usage: buildboard add-dir <absolute-path>" >&2; exit 1; }
+    node "$APP_DIR/dist/server.js" --add-dir "$2"
+    ;;
   *)
-    echo "usage: buildboard start|stop|status|logs [n]" >&2
+    echo "usage: buildboard start|stop|status|logs [n]|add-dir <path>" >&2
     exit 1
     ;;
 esac

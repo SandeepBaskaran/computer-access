@@ -1,10 +1,11 @@
 /**
- * Build Board bridge — task orchestration on top of the existing MCP server.
+ * Build bridge — a generic local build executor behind MCP. Its entire
+ * vocabulary is: directory + local agent + mode + prompt + opaque jobId.
+ * It knows nothing about whichever tool dispatches the work.
  *
- * Three operations drive the whole board lifecycle:
  *   startTask     — async dispatch of a coding-agent CLI in an isolated worktree
- *   getJobStatus  — durable job state + log excerpt for board comments
- *   mergeTask     — gated --no-ff merge to main (or single-task revert)
+ *   getJobStatus  — durable job state + log excerpt for the caller
+ *   mergeTask     — gated --no-ff merge to main (or single-job revert)
  *
  * Dependency-injected (isPathAllowed comes from server.ts) so the smoke test
  * can drive it directly without ngrok/express.
@@ -20,7 +21,6 @@ import { ProviderRegistry, ProviderEntry, PlanMode, loadProviders, resolveProvid
 import { spawnPty, PtyHandle } from "./pty.js";
 import { PowerAssertion } from "./power.js";
 import { WakeDetector } from "./wake.js";
-import { BoardClient, BoardCard } from "./notion.js";
 
 const execFileP = promisify(execFile);
 
@@ -45,20 +45,12 @@ export interface BridgeConfig {
   planIdleMs: number;
   /** Recovery policy for jobs whose process died: resume (provider session) | rerun (original brief) | rework (fail with note). */
   resumeStrategy: "resume" | "rerun" | "rework";
-  /** Board self-scan interval while awake (0/absent boardClient disables). */
-  selfScanIntervalMs: number;
   /** Wall-clock gap treated as a wake from sleep. */
   wakeGapMs: number;
-  /** Bridge's own board access for self-scan (cloud agent stays the redundant path). */
-  boardClient?: BoardClient;
-  /** Default execution posture when a card has no Mode set. */
+  /** Default execution posture when the caller doesn't specify one. */
   defaultMode?: "auto" | "accept_edits";
   /** User-authorized dependency installs inside allowlisted repos (default true). */
   allowPackageInstalls?: boolean;
-  /** board-map.json content: property/option names the bridge writes — never hard-coded in logic. */
-  boardMap?: BoardMap;
-  /** Data source id stamped onto each job so writebacks target the right board. */
-  boardId?: string;
   /** Verifies the public tunnel (e.g. ngrok local API); bridge only reports/logs — KeepAlive restarts the tunnel service. */
   tunnelCheck?: () => Promise<{ up: boolean; url?: string }>;
   /** Break-glass switch: when true, merge/revert refuse outright. */
@@ -67,14 +59,17 @@ export interface BridgeConfig {
 }
 
 export interface StartTaskParams {
-  taskId: string;
-  pageId: string;
+  /** Opaque caller-supplied id — the idempotency/dedup key. */
+  jobId: string;
   repoPath: string;
-  brief: string;
-  codingAgent?: string;
-  verifyCommand?: string;
-  /** Execution posture from the card's Mode select (default: DEFAULT_MODE, "auto"). */
+  /** Natural-language work description. */
+  prompt: string;
+  agent?: string;
+  /** Execution posture (default: DEFAULT_MODE, "auto"). */
   mode?: TaskMode;
+  verifyCommand?: string;
+  /** Branch to work on (default: job/<jobId>). */
+  branch?: string;
 }
 
 const ERROR_CAP = 8 * 1024;
@@ -82,23 +77,6 @@ const EXCERPT_LINES = 50;
 const HEARTBEAT_DB_THROTTLE_MS = 2000;
 
 export type TaskMode = "auto" | "accept_edits";
-
-/** Names the bridge writes to the board — resolved from board-map.json, never hard-coded. */
-export interface BoardMap {
-  statusOptions: {
-    todo: string; planning: string; ready_for_dev: string; in_progress: string;
-    in_review: string; rework: string; hold: string; approved: string; merged: string; failed: string;
-  };
-  modeOptions: { auto: string; accept_edits: string };
-}
-
-export const DEFAULT_BOARD_MAP: BoardMap = {
-  statusOptions: {
-    todo: "Todo", planning: "Planning", ready_for_dev: "Ready for Dev", in_progress: "In Progress",
-    in_review: "In Review", rework: "Rework", hold: "Hold", approved: "Approved", merged: "Merged", failed: "Failed",
-  },
-  modeOptions: { auto: "Auto approve", accept_edits: "Accept edits" },
-};
 
 /** User-authorized package installs: the only thing gated is the PATTERN, and only when the user opts out. */
 const INSTALL_RE = /\b(npm|pnpm|yarn|bun)\s+(i|install|add)\b|\bpip3?\s+install\b|\bcargo\s+(install|add)\b|\bbrew\s+install\b|\bgem\s+install\b|\bpoetry\s+add\b|\buv\s+(pip\s+install|add)\b/i;
@@ -173,7 +151,6 @@ export function classifyHold(output: string): { reason: HoldReason; question: st
 }
 
 export function createBridge(cfg: BridgeConfig) {
-  const boardMap = cfg.boardMap ?? DEFAULT_BOARD_MAP;
   const defaultMode: TaskMode = cfg.defaultMode ?? "auto";
   const allowPackageInstalls = cfg.allowPackageInstalls ?? true;
   const logsDir = path.join(cfg.dataDir, "logs");
@@ -232,14 +209,15 @@ export function createBridge(cfg: BridgeConfig) {
    * git repository, and sit inside ALLOWED_DIRS. Returns the exact reason on
    * failure — never guesses a path.
    */
-  async function validateRepo(repoPath: string): Promise<{ ok: true; repo: string } | { ok: false; reason: string }> {
+  async function validateRepo(repoPath: string): Promise<{ ok: boolean; repo?: string; reason?: string; notGit?: boolean }> {
     const repo = path.resolve(repoPath);
     const s = await stat(repo).catch(() => null);
     if (!s) return { ok: false, reason: `path does not exist: ${repo}` };
     if (!s.isDirectory()) return { ok: false, reason: `path is not a directory: ${repo}` };
     if (!(await cfg.isPathAllowed(repo))) return { ok: false, reason: `path is outside ALLOWED_DIRS: ${repo}` };
     const g = await stat(path.join(repo, ".git")).catch(() => null);
-    if (!g) return { ok: false, reason: `not a git repository (no .git): ${repo}` };
+    // notGit is recoverable: callers park the job awaiting permission to `git init`.
+    if (!g) return { ok: false, repo, reason: `not a git repository (no .git): ${repo}`, notGit: true };
     return { ok: true, repo };
   }
 
@@ -249,28 +227,34 @@ export function createBridge(cfg: BridgeConfig) {
     }
   }
 
+  /** DB state → the generic API vocabulary every response speaks. */
+  function apiState(job: JobRecord): string {
+    if (job.state === "in_progress") return "running";
+    if (job.state === "hold") return job.hold_reason === "needs_input" ? "awaiting_input" : "paused";
+    return job.state; // planning | planned | queued | in_review | failed | merged | cancelled | reverted
+  }
+
   async function jobStatusPayload(job: JobRecord, withExcerpt: boolean) {
+    const state = apiState(job);
     return {
-      taskId: job.task_id,
-      pageId: job.page_id,
-      state: job.state,
-      provider: job.provider,
+      jobId: job.job_key,
+      state,
+      agent: job.provider,
       mode: job.mode,
       repoPath: job.repo_path,
-      branch: job.branch,
-      worktree: job.worktree_path,
+      branch: job.branch || null,
+      worktree: job.worktree_path || null,
       prUrl: job.pr_url,
       branchUrl: job.branch_url,
       localOnly: job.local_only === 1,
       mergeCommit: job.merge_commit,
+      diffStat: job.diff_stat,
       error: job.error,
-      holdReason: job.hold_reason,
-      prevState: job.prev_state,
       question: job.question,
-      holdSince: job.hold_since ? new Date(job.hold_since).toISOString() : null,
+      pausedReason: state === "paused" ? job.hold_reason : null,
       // Plan results ride along on planned jobs; needsInput flags a pending question.
       ...(job.state === "planned" ? { plan: job.plan, needsInput: !!job.question } : {}),
-      ...(job.plan_provider ? { planProvider: job.plan_provider } : {}),
+      ...(job.plan_provider ? { planAgent: job.plan_provider } : {}),
       lastHeartbeat: job.last_heartbeat ? new Date(job.last_heartbeat).toISOString() : null,
       createdAt: new Date(job.created_at).toISOString(),
       startedAt: job.started_at ? new Date(job.started_at).toISOString() : null,
@@ -280,11 +264,11 @@ export function createBridge(cfg: BridgeConfig) {
     };
   }
 
-  /** Resolve verifyCommand: explicit param > .buildboard.json in the worktree > skip. */
+  /** Resolve verifyCommand: explicit param > .bridge.json in the worktree > skip. */
   async function resolveVerifyCommand(job: JobRecord): Promise<string | null> {
     if (job.verify_command) return job.verify_command;
     try {
-      const raw = await readFile(path.join(job.worktree_path, ".buildboard.json"), "utf-8");
+      const raw = await readFile(path.join(job.worktree_path, ".bridge.json"), "utf-8");
       const parsed = JSON.parse(raw);
       if (typeof parsed.verifyCommand === "string" && parsed.verifyCommand.trim()) return parsed.verifyCommand;
     } catch { /* no per-repo config */ }
@@ -407,7 +391,7 @@ export function createBridge(cfg: BridgeConfig) {
    * SUPERVISED build (Mode: Accept edits): the provider runs in its
    * accept-edits posture under a pty. Edits auto-apply; when the CLI pauses on
    * a higher-risk action (shell/install/delete/network) its question is
-   * relayed to the board via hold(needs_input) and answer-task feeds the reply
+   * relayed to the caller via awaiting_input and answer feeds the reply
    * back into the live session. Builds finish ONLY on process exit — idle
    * without a question just keeps waiting (the stale sweep is the backstop).
    */
@@ -440,7 +424,7 @@ export function createBridge(cfg: BridgeConfig) {
       const lines = stripAnsi(session.transcript).split("\n").map(l => l.trim()).filter(Boolean);
       const q = [...lines.slice(-6)].reverse().find(l => l.endsWith("?"));
       if (q) {
-        // Higher-risk action paused the CLI — relay the exact prompt to the board.
+        // Higher-risk action paused the CLI — relay the exact prompt to the caller.
         hold(taskId, "needs_input", "in_progress", "Supervised build is waiting for approval/input", truncate(q, 500));
       } else {
         session.arm(); // builds complete on EXIT, never on idle
@@ -486,7 +470,7 @@ export function createBridge(cfg: BridgeConfig) {
     const job = store.getByTaskId(taskId);
     if (!job || isCancelled(taskId)) return;
 
-    // 2. Verify (param > .buildboard.json > skip)
+    // 2. Verify (param > .bridge.json > skip)
     const verifyCmd = await resolveVerifyCommand(job);
     // User-authorized installs: permitted by design inside allowlisted repos.
     // Only when the user opts OUT (ALLOW_PACKAGE_INSTALLS=false) are install
@@ -525,14 +509,23 @@ export function createBridge(cfg: BridgeConfig) {
       return;
     }
 
-    // Empty diff after the build → nothing to review; flag it, don't push.
+    // Empty diff after the build → finish in_review with an empty diffStat so
+    // the caller can see at a glance that nothing changed.
     const baseBranch = await detectMainBranch(job.worktree_path).catch(() => null);
+    let diffStat = "";
     if (baseBranch) {
       const { stdout: aheadOut } = await git(job.worktree_path, ["rev-list", "--count", `${baseBranch}..${job.branch}`]).catch(() => ({ stdout: "" } as any));
       if (aheadOut.trim() === "0") {
-        fail(taskId, `no changes: the build produced an empty diff (no commits ahead of ${baseBranch}). The agent should flag this on the board.`);
+        store.update(taskId, {
+          state: "in_review", diff_stat: "", error: null,
+          hold_reason: null, prev_state: null, question: null, hold_since: null,
+          finished_at: Date.now(), pid: null,
+        });
+        console.error(`[JOB] ${taskId}: build produced an empty diff — in_review with empty diffStat`);
         return;
       }
+      const { stdout: statOut } = await git(job.worktree_path, ["diff", "--shortstat", `${baseBranch}...HEAD`]).catch(() => ({ stdout: "" } as any));
+      diffStat = statOut.trim();
     }
 
     // 4. Push + PR (graceful when the repo has no origin)
@@ -573,6 +566,7 @@ export function createBridge(cfg: BridgeConfig) {
       pr_url: prUrl,
       branch_url: branchUrl,
       local_only: localOnly ? 1 : 0,
+      diff_stat: diffStat,
       error: null,
       hold_reason: null, prev_state: null, question: null, hold_since: null,
       finished_at: Date.now(),
@@ -582,7 +576,7 @@ export function createBridge(cfg: BridgeConfig) {
 
   function commitMessage(job: JobRecord): string {
     const summary = job.brief.replace(/\s+/g, " ").trim().slice(0, 60);
-    return `task/${job.task_id}: ${summary}`;
+    return `job/${job.task_id}: ${summary}`;
   }
 
   async function ensureWorktree(job: { repo_path: string; branch: string; worktree_path: string }, baseBranch: string, reuseExistingBranch: boolean): Promise<void> {
@@ -601,84 +595,104 @@ export function createBridge(cfg: BridgeConfig) {
     }
   }
 
+  /** Full new-row skeleton so insert call sites stay small. */
+  function newJobRow(fields: Partial<JobRecord> & { task_id: string; job_key: string; repo_path: string; state: JobState; brief: string; provider: string }): JobRecord {
+    const now = Date.now();
+    return {
+      branch: "", worktree_path: "", verify_command: null,
+      pr_url: null, branch_url: null, merge_commit: null, error: null, local_only: null,
+      plan: null, plan_provider: null, plan_complex: null, session_id: null, mode: null,
+      pending_action: null, diff_stat: null,
+      hold_reason: null, prev_state: null, question: null, hold_since: null,
+      pid: null, last_heartbeat: now, created_at: now, started_at: now, finished_at: null, merged_at: null, cleaned_at: null,
+      ...fields,
+    } as JobRecord;
+  }
+
+  function upsertJob(existing: JobRecord | undefined, row: JobRecord): string {
+    if (existing) {
+      const { task_id, created_at, ...fields } = row;
+      store.update(existing.task_id, fields);
+      return existing.task_id;
+    }
+    store.insert(row);
+    return row.task_id;
+  }
+
+  /** Park a job awaiting the user's permission to `git init` the target directory. */
+  function requestGitInit(existing: JobRecord | undefined, row: JobRecord, target: "in_progress" | "planning"): any {
+    const question = `${row.repo_path} is not a git repository. Reply "yes" (via answer) to let the bridge run \`git init\` with an initial commit and continue, or anything else to abort this job.`;
+    const id = upsertJob(existing, {
+      ...row,
+      state: "hold", hold_reason: "needs_input", prev_state: target,
+      pending_action: "git_init", question, hold_since: Date.now(),
+    });
+    console.error(`[JOB] ${id}: target directory has no git repo — awaiting permission to git init`);
+    return { started: true, state: "awaiting_input", jobId: row.job_key, question };
+  }
+
   async function startTask(params: StartTaskParams): Promise<any> {
     await registryReady;
-    const { pageId, repoPath, brief } = params;
-    if (!params.taskId?.trim() || !pageId?.trim() || !repoPath?.trim() || !brief?.trim()) {
-      throw new Error("taskId, pageId, repoPath, and brief are all required");
+    const { jobId, repoPath, prompt } = params;
+    if (!jobId?.trim() || !repoPath?.trim() || !prompt?.trim()) {
+      throw new Error("jobId, repoPath, and prompt are all required");
     }
-    const taskId = slugifyTaskId(params.taskId);
-    const provider = resolveProvider(registry, params.codingAgent, cfg.defaultProvider);
+    const taskId = slugifyTaskId(jobId);
+    const provider = resolveProvider(registry, params.agent, cfg.defaultProvider);
 
     // Repo validation BEFORE any work — exact reason, never a guessed path.
     const repoCheck = await validateRepo(repoPath);
-    if (!repoCheck.ok) return { error: "invalidRepo", reason: repoCheck.reason };
-    const repo = repoCheck.repo;
+    if (!repoCheck.ok && !repoCheck.notGit) return { started: false, error: "invalidRepo", invalidRepo: repoCheck.reason };
+    const repo = repoCheck.repo!;
 
-    // Idempotency — page_id is the dedup key. A plan-only row created without a
-    // pageId carries the placeholder `plan-<taskId>`; the build adopts it.
-    let existing = store.getByPageId(pageId);
-    const byTaskId = store.getByTaskId(taskId);
-    if (!existing && byTaskId) {
-      if (byTaskId.page_id === `plan-${taskId}`) existing = byTaskId;
-      else throw new Error(`taskId '${taskId}' is already used by a different board page (${byTaskId.page_id}). Task IDs must be unique.`);
-    } else if (existing && byTaskId && byTaskId.page_id !== pageId) {
-      throw new Error(`taskId '${taskId}' is already used by a different board page (${byTaskId.page_id}). Task IDs must be unique.`);
+    // Idempotency — jobId is the opaque caller-supplied dedup key.
+    const existing = store.getByJobKey(jobId) ?? store.getByTaskId(taskId);
+    if (existing && existing.job_key !== jobId) {
+      throw new Error(`jobId '${jobId}' collides with existing job '${existing.job_key}' (both slug to '${taskId}'). Job ids must be unique.`);
     }
-    if (existing && existing.state === "in_progress") {
-      return { alreadyRunning: true, ...(await jobStatusPayload(existing, false)) };
+    if (existing && (existing.state === "in_progress" || (existing.state === "queued" && existing.pending_action === "queued_build"))) {
+      return { started: false, alreadyRunning: true, ...(await jobStatusPayload(existing, false)) };
     }
     if (existing && existing.state === "planning") {
-      return { error: "planningInProgress", message: `Task '${existing.task_id}' has a plan run in progress — wait for state 'planned' before building.` };
+      return { started: false, error: "planningInProgress", message: `Job '${jobId}' has a plan run in progress — wait for state 'planned' before building.` };
     }
     if (existing && (existing.state === "merged" || existing.state === "reverted")) {
-      throw new Error(`Task '${existing.task_id}' is already ${existing.state}. Create a new board task for follow-up work.`);
+      throw new Error(`Job '${jobId}' is already ${existing.state}. Use a new jobId for follow-up work.`);
     }
 
-    // Concurrency cap — the agent retries on its next wake.
+    const branch = params.branch && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(params.branch) ? params.branch : `job/${taskId}`;
+    const mode: TaskMode = params.mode === "accept_edits" ? "accept_edits" : params.mode === "auto" ? "auto" : defaultMode;
+    const row = newJobRow({
+      task_id: existing?.task_id ?? taskId, job_key: jobId, repo_path: repo, branch,
+      worktree_path: existing?.worktree_path ?? "", provider: provider.name, state: "in_progress",
+      brief: prompt, verify_command: params.verifyCommand ?? existing?.verify_command ?? null, mode,
+    });
+
+    // Directory exists but has no .git → never guess: ask permission to init.
+    if (repoCheck.notGit) return requestGitInit(existing, row, "in_progress");
+
+    // Capacity full → QUEUE (FIFO); the sweep dispatches as slots free up.
     if (store.countRunning() >= cfg.maxConcurrentJobs) {
-      return { error: "capacityExceeded", running: store.countRunning(), maxConcurrentJobs: cfg.maxConcurrentJobs, message: "Concurrency cap reached — retry on the next agent wake." };
+      const id = upsertJob(existing, { ...row, state: "queued", pending_action: "queued_build" });
+      console.error(`[QUEUE] ${id}: queued (capacity ${cfg.maxConcurrentJobs} full, position ${store.countQueued()})`);
+      return { started: true, queued: true, state: "queued", jobId, position: store.countQueued() };
     }
 
-    const branch = `task/${taskId}`;
-    // A row with no worktree yet is plan-only history — the build starts fresh
-    // from the base branch. A row with a worktree is build Rework: reuse it.
+    // A row with no worktree yet has no build history — start fresh from the
+    // base branch. A row with a worktree is a re-run: reuse it.
     const hadBuild = !!existing && existing.worktree_path !== "";
     const worktree = (hadBuild && existing!.worktree_path) || path.join(cfg.worktreeRoot, taskId);
     const baseBranch = await detectMainBranch(repo);
     await ensureWorktree({ repo_path: repo, branch, worktree_path: worktree }, baseBranch, hadBuild);
 
-    const mode: TaskMode = params.mode === "accept_edits" ? "accept_edits" : params.mode === "auto" ? "auto" : defaultMode;
-    const now = Date.now();
-    if (existing) {
-      store.update(existing.task_id, {
-        state: "in_progress", brief, provider: provider.name,
-        page_id: pageId, repo_path: repo, branch, worktree_path: worktree,
-        verify_command: params.verifyCommand ?? existing.verify_command,
-        mode, board_id: existing.board_id ?? cfg.boardId ?? null,
-        error: null, hold_reason: null, prev_state: null, question: null, hold_since: null,
-        started_at: now, finished_at: null, last_heartbeat: now,
-      });
-    } else {
-      store.insert({
-        task_id: taskId, page_id: pageId, repo_path: repo, branch, worktree_path: worktree,
-        provider: provider.name, state: "in_progress", brief,
-        verify_command: params.verifyCommand ?? null,
-        mode, board_id: cfg.boardId ?? null,
-        pr_url: null, branch_url: null, merge_commit: null, error: null, local_only: null, plan: null, plan_provider: null, plan_complex: null, session_id: null,
-        hold_reason: null, prev_state: null, question: null, hold_since: null,
-        pid: null, last_heartbeat: now, started_at: now, finished_at: null, merged_at: null, cleaned_at: null,
-      });
-    }
-
-    const effectiveTaskId = existing?.task_id ?? taskId;
+    const effectiveTaskId = upsertJob(existing, { ...row, worktree_path: worktree });
     // Fire and forget — the SSE call returns immediately; runJob owns every outcome.
     runJob(effectiveTaskId).catch((e: any) => fail(effectiveTaskId, `Internal bridge error: ${e.message}`));
     updatePower(); // job active → hold the sleep assertion immediately
 
     return {
-      taskId: effectiveTaskId, state: "in_progress", branch, worktree,
-      provider: provider.name, mode, rework: hadBuild, logPath: logPath(effectiveTaskId),
+      started: true, jobId, state: "running", branch, worktree,
+      agent: provider.name, mode, rework: hadBuild, logPath: logPath(effectiveTaskId),
     };
   }
 
@@ -919,14 +933,37 @@ export function createBridge(cfg: BridgeConfig) {
    * session died (or the bridge restarted), the answer is folded into the
    * brief and the job cleanly re-runs.
    */
-  async function answerTask(taskId: string, answer: string): Promise<any> {
+  async function answerTask(jobId: string, answer: string): Promise<any> {
     if (!answer?.trim()) throw new Error("answer is required");
-    const job = store.getByTaskId(slugifyTaskId(taskId));
-    if (!job) return { resumed: false, error: "notFound", taskId };
+    const job = findJob(jobId);
+    if (!job) return { accepted: false, resumed: false, error: "notFound", jobId };
     if (job.state !== "hold" || job.hold_reason !== "needs_input") {
-      return { resumed: false, error: "invalidState", message: `Task is '${job.state}'${job.hold_reason ? ` (${job.hold_reason})` : ""} — answer-task only applies to hold(needs_input).` };
+      return { accepted: false, resumed: false, error: "invalidState", message: `Job is '${job.state}'${job.hold_reason ? ` (${job.hold_reason})` : ""} — answer only applies to awaiting_input.` };
     }
     const now = Date.now();
+
+    // Pending git init: the user was asked for permission to initialize the directory.
+    if (job.pending_action === "git_init") {
+      if (!/^\s*(y(es|ep|eah)?|ok(ay)?|sure|go( ahead)?|init|do it|proceed|approved?)\b/i.test(answer)) {
+        fail(job.task_id, `user declined git init for ${job.repo_path}`);
+        return { accepted: true, resumed: false, declined: true, state: "failed" };
+      }
+      await git(job.repo_path, ["init", "-b", "main"]);
+      await git(job.repo_path, ["commit", "--allow-empty", "-m", `initial commit (git init authorized via job ${job.job_key})`]);
+      console.error(`[JOB] ${job.task_id}: git init authorized and completed in ${job.repo_path}`);
+      const target: JobState = job.prev_state === "planning" ? "planning" : "in_progress";
+      if (target === "in_progress") {
+        const worktree = job.worktree_path || path.join(cfg.worktreeRoot, job.task_id);
+        await ensureWorktree({ repo_path: job.repo_path, branch: job.branch, worktree_path: worktree }, "main", false);
+        store.update(job.task_id, { state: target, worktree_path: worktree, pending_action: null, hold_reason: null, question: null, hold_since: null, prev_state: null, error: null, started_at: now, last_heartbeat: now });
+        runJob(job.task_id).catch((e: any) => fail(job.task_id, `Internal bridge error: ${e.message}`));
+      } else {
+        store.update(job.task_id, { state: target, pending_action: null, hold_reason: null, question: null, hold_since: null, prev_state: null, error: null, started_at: now, last_heartbeat: now });
+        runPlanJob(job.task_id).catch((e: any) => fail(job.task_id, `Internal bridge error: ${e.message}`));
+      }
+      updatePower();
+      return { accepted: true, resumed: true, mode: "git_init", jobId: job.job_key, state: target === "in_progress" ? "running" : "planning" };
+    }
     const session = activePlanSessions.get(job.task_id);
     if (session && !session.finished) {
       const resumeState: JobState = session.kind === "build" ? "in_progress" : "planning";
@@ -937,7 +974,7 @@ export function createBridge(cfg: BridgeConfig) {
       session.pty.write(answer + "\r");
       session.arm();
       updatePower();
-      return { resumed: true, mode: "session", taskId: job.task_id, state: resumeState };
+      return { accepted: true, resumed: true, mode: "session", jobId: job.job_key, state: resumeState === "in_progress" ? "running" : "planning" };
     }
     // No live session (bridge restarted / headless question / session died):
     // fold the answer into the brief and re-run from scratch.
@@ -951,7 +988,7 @@ export function createBridge(cfg: BridgeConfig) {
     if (target === "in_progress") runJob(job.task_id).catch((e: any) => fail(job.task_id, `Internal bridge error: ${e.message}`));
     else runPlanJob(job.task_id).catch((e: any) => fail(job.task_id, `Internal bridge error: ${e.message}`));
     updatePower();
-    return { resumed: true, mode: "replanned", taskId: job.task_id, state: target };
+    return { accepted: true, resumed: true, mode: "rerun", jobId: job.job_key, state: target === "in_progress" ? "running" : "planning" };
   }
 
   /**
@@ -960,16 +997,16 @@ export function createBridge(cfg: BridgeConfig) {
    * running; `planned` → result in the `plan` field (+ optional question).
    * Refuses (never falls back to build mode) when the provider has no plan mode.
    */
-  async function planTask(params: { taskId: string; pageId?: string; repoPath: string; brief: string; codingAgent?: string; complex?: boolean }): Promise<any> {
+  async function planTask(params: { jobId: string; repoPath: string; prompt: string; agent?: string; complex?: boolean }): Promise<any> {
     await registryReady;
-    if (!params.taskId?.trim() || !params.repoPath?.trim() || !params.brief?.trim()) {
-      throw new Error("taskId, repoPath, and brief are required");
+    const { jobId } = params;
+    if (!jobId?.trim() || !params.repoPath?.trim() || !params.prompt?.trim()) {
+      throw new Error("jobId, repoPath, and prompt are required");
     }
-    const taskId = slugifyTaskId(params.taskId);
-    const pageId = params.pageId?.trim() || `plan-${taskId}`;
-    // The card's agent stays the BUILD provider; only the plan run may be
-    // delegated to PLAN_FALLBACK_AGENT when the card's agent can't plan.
-    const provider = resolveProvider(registry, params.codingAgent, cfg.defaultProvider);
+    const taskId = slugifyTaskId(jobId);
+    // The caller's agent stays the BUILD agent; only the plan run may be
+    // delegated to PLAN_FALLBACK_AGENT when that agent can't plan.
+    const provider = resolveProvider(registry, params.agent, cfg.defaultProvider);
     let planProvider = provider;
     if (!provider.entry.planSupported) {
       const fbName = cfg.planFallbackAgent?.trim();
@@ -983,58 +1020,53 @@ export function createBridge(cfg: BridgeConfig) {
       }
     }
     const repoCheck = await validateRepo(params.repoPath);
-    if (!repoCheck.ok) return { error: "invalidRepo", reason: repoCheck.reason };
+    if (!repoCheck.ok && !repoCheck.notGit) return { started: false, error: "invalidRepo", invalidRepo: repoCheck.reason };
 
-    const existing = store.getByTaskId(taskId) ?? store.getByPageId(pageId);
-    if (existing && existing.state === "planning") {
+    const existing = store.getByJobKey(jobId) ?? store.getByTaskId(taskId);
+    if (existing && existing.job_key !== jobId) {
+      throw new Error(`jobId '${jobId}' collides with existing job '${existing.job_key}' (both slug to '${taskId}'). Job ids must be unique.`);
+    }
+    if (existing && (existing.state === "planning" || (existing.state === "queued" && existing.pending_action === "queued_plan"))) {
       return { started: false, alreadyPlanning: true, ...(await jobStatusPayload(existing, false)) };
     }
     if (existing && (existing.state === "in_progress" || existing.state === "in_review" || existing.state === "merged" || existing.state === "reverted")) {
-      return { started: false, error: "invalidState", message: `Task '${existing.task_id}' is already in build state '${existing.state}' — planning happens before Ready for Dev.` };
-    }
-    if (store.countRunning() >= cfg.maxConcurrentJobs) {
-      return { started: false, error: "capacityExceeded", running: store.countRunning(), maxConcurrentJobs: cfg.maxConcurrentJobs, message: "Concurrency cap reached — retry on the next agent wake." };
+      return { started: false, error: "invalidState", message: `Job '${jobId}' is already in build state '${existing.state}' — planning happens before building.` };
     }
 
-    const now = Date.now();
-    if (existing) {
-      // Re-plan (new brief) or resume after failed/hold/cancelled/planned.
-      store.update(existing.task_id, {
-        state: "planning", brief: params.brief, provider: provider.name, plan_provider: planProvider.name, repo_path: repoCheck.repo,
-        plan_complex: params.complex ? 1 : 0,
-        plan: null, error: null, hold_reason: null, prev_state: null, question: null, hold_since: null,
-        started_at: now, finished_at: null, last_heartbeat: now,
-      });
-    } else {
-      store.insert({
-        task_id: taskId, page_id: pageId, repo_path: repoCheck.repo,
-        branch: "", worktree_path: "", // plan jobs write nothing and create no branch
-        provider: provider.name, state: "planning", brief: params.brief,
-        verify_command: null, pr_url: null, branch_url: null, merge_commit: null,
-        error: null, local_only: null, plan: null, plan_provider: planProvider.name,
-        plan_complex: params.complex ? 1 : 0, session_id: null,
-        mode: null, board_id: cfg.boardId ?? null,
-        hold_reason: null, prev_state: null, question: null, hold_since: null,
-        pid: null, last_heartbeat: now, started_at: now, finished_at: null, merged_at: null, cleaned_at: null,
-      });
+    const row = newJobRow({
+      task_id: existing?.task_id ?? taskId, job_key: jobId, repo_path: repoCheck.repo!,
+      branch: existing?.branch ?? "", worktree_path: existing?.worktree_path ?? "", // plan jobs write nothing and create no branch
+      provider: provider.name, state: "planning", brief: params.prompt,
+      plan: null, plan_provider: planProvider.name, plan_complex: params.complex ? 1 : 0,
+    });
+
+    // Directory exists but has no .git → never guess: ask permission to init.
+    if (repoCheck.notGit) return requestGitInit(existing, row, "planning");
+
+    // Capacity full → queue the plan too (FIFO with builds).
+    if (store.countRunning() >= cfg.maxConcurrentJobs) {
+      const id = upsertJob(existing, { ...row, state: "queued", pending_action: "queued_plan" });
+      console.error(`[QUEUE] ${id}: plan queued (capacity ${cfg.maxConcurrentJobs} full)`);
+      return { started: true, queued: true, state: "queued", jobId };
     }
-    const effectiveTaskId = existing?.task_id ?? taskId;
+
+    const effectiveTaskId = upsertJob(existing, row);
     runPlanJob(effectiveTaskId).catch((e: any) => fail(effectiveTaskId, `Internal bridge error: ${e.message}`));
     updatePower(); // plan job active → hold the sleep assertion immediately
     return {
-      started: true, taskId: effectiveTaskId, state: "planning",
-      provider: provider.name, planProvider: planProvider.name,
+      started: true, jobId, state: "planning",
+      agent: provider.name, planAgent: planProvider.name,
       ...(planProvider.name !== provider.name ? { fallback: true } : {}),
       logPath: planLogPath(effectiveTaskId),
     };
   }
 
   /** Kill a running/held/planning job, remove its worktree (builds only), KEEP the branch. */
-  async function cancelTask(taskId: string): Promise<any> {
-    const job = store.getByTaskId(slugifyTaskId(taskId));
-    if (!job) return { cancelled: false, error: "notFound", taskId };
-    if (job.state !== "in_progress" && job.state !== "hold" && job.state !== "planning") {
-      return { cancelled: false, error: "invalidState", message: `Cannot cancel a job in state '${job.state}' — only in_progress, planning, or hold jobs can be cancelled.` };
+  async function cancelTask(jobId: string): Promise<any> {
+    const job = findJob(jobId);
+    if (!job) return { cancelled: false, error: "notFound", jobId };
+    if (job.state !== "in_progress" && job.state !== "hold" && job.state !== "planning" && job.state !== "queued") {
+      return { cancelled: false, error: "invalidState", message: `Cannot cancel a job in state '${job.state}' — only running, planning, queued, or paused jobs can be cancelled.` };
     }
     // Mark cancelled FIRST so the in-flight run continuation can't overwrite it.
     store.update(job.task_id, {
@@ -1048,26 +1080,30 @@ export function createBridge(cfg: BridgeConfig) {
       await git(job.repo_path, ["worktree", "prune"]).catch(() => {});
     }
     store.update(job.task_id, { pid: null });
-    return { cancelled: true, taskId: job.task_id, ...(job.branch ? { branchKept: job.branch } : {}), ...(job.worktree_path ? { worktreeRemoved: job.worktree_path } : {}) };
+    return { cancelled: true, jobId: job.job_key, ...(job.branch ? { branchKept: job.branch } : {}), ...(job.worktree_path ? { worktreeRemoved: job.worktree_path } : {}) };
   }
 
-  async function getJobStatus(taskId?: string): Promise<any> {
-    if (taskId?.trim()) {
-      const job = store.getByTaskId(slugifyTaskId(taskId)) ?? store.getByPageId(taskId.trim());
-      if (!job) return { error: "notFound", taskId };
+  function findJob(ref: string): JobRecord | undefined {
+    return store.getByJobKey(ref.trim()) ?? store.getByTaskId(slugifyTaskId(ref));
+  }
+
+  async function getJobStatus(jobId?: string): Promise<any> {
+    if (jobId?.trim()) {
+      const job = findJob(jobId);
+      if (!job) return { error: "notFound", jobId };
       return jobStatusPayload(job, true);
     }
     const jobs = store.listRecent(50);
     return { jobs: await Promise.all(jobs.map(j => jobStatusPayload(j, false))) };
   }
 
-  async function mergeTask(taskId: string, action: "merge" | "revert" = "merge"): Promise<any> {
-    // Break-glass gate: default OFF; the board (human moves card to Approved) is the real gate.
+  async function mergeTask(jobId: string, action: "merge" | "revert" = "merge"): Promise<any> {
+    // Break-glass gate: default OFF; the caller's own approval flow is the real gate.
     if (cfg.confirmationGateEnabled()) {
       return { merged: false, error: "confirmationGateActive", message: "Autonomous merges are disabled: ENABLE_CONFIRMATION_GATE is on. Merge manually or unset the gate." };
     }
-    const job = store.getByTaskId(slugifyTaskId(taskId));
-    if (!job) return { merged: false, error: "notFound", taskId };
+    const job = findJob(jobId);
+    if (!job) return { merged: false, error: "notFound", jobId };
 
     const repo = job.repo_path;
     if (!(await isWorkingTreeClean(repo))) {
@@ -1086,7 +1122,7 @@ export function createBridge(cfg: BridgeConfig) {
 
     if (action === "revert") {
       if (job.state !== "merged" || !job.merge_commit) {
-        return { merged: false, error: "invalidState", message: `Cannot revert task in state '${job.state}' — only merged tasks can be reverted.` };
+        return { merged: false, error: "invalidState", message: `Cannot revert a job in state '${job.state}' — only merged tasks can be reverted.` };
       }
       const windowMs = cfg.revertWindowHours * 3600 * 1000;
       if (!job.merged_at || Date.now() - job.merged_at > windowMs) {
@@ -1104,12 +1140,12 @@ export function createBridge(cfg: BridgeConfig) {
       if (origin) await git(repo, ["push", "origin", mainBranch]).catch(() => { pushFailed = true; });
       await restoreBranch();
       store.update(job.task_id, { state: "reverted", error: pushFailed ? `revert committed locally but push of ${mainBranch} failed` : null });
-      return { reverted: true, taskId: job.task_id, ...(pushFailed ? { pushFailed } : {}) };
+      return { reverted: true, jobId: job.job_key, ...(pushFailed ? { pushFailed } : {}) };
     }
 
     // action === "merge" — machine-side guard: only reviewable work merges.
     if (job.state !== "in_review") {
-      return { merged: false, error: "invalidState", message: `Task is '${job.state}' — merge requires 'in_review'. The board's Approved column is the gate; the bridge only checks the work actually finished.` };
+      return { merged: false, error: "invalidState", message: `Job is '${job.state}' — merge requires 'in_review'. Approval flows live with the caller; the bridge only checks the work actually finished.` };
     }
 
     await git(repo, ["checkout", mainBranch]);
@@ -1120,7 +1156,7 @@ export function createBridge(cfg: BridgeConfig) {
       const conflictFiles = conflictsOut.trim().split("\n").filter(Boolean);
       await git(repo, ["merge", "--abort"]).catch(() => {});
       await restoreBranch();
-      // Worktree and branch stay intact — the agent moves the card to Rework.
+      // Worktree and branch stay intact — the caller decides what happens next.
       store.update(job.task_id, { error: `merge conflict with ${mainBranch}: ${conflictFiles.join(", ") || truncate(e.stderr || e.message, 500)}` });
       return { merged: false, conflict: true, conflictFiles };
     }
@@ -1140,7 +1176,7 @@ export function createBridge(cfg: BridgeConfig) {
       state: "merged", merge_commit: mergeCommit, merged_at: Date.now(),
       error: pushFailed ? `merged locally but push of ${mainBranch} failed — push manually` : null,
     });
-    return { merged: true, taskId: job.task_id, mergeCommit, branchKept: job.branch, ...(pushFailed ? { pushFailed } : {}) };
+    return { merged: true, jobId: job.job_key, mergeCommit, branchKept: job.branch, ...(pushFailed ? { pushFailed } : {}) };
   }
 
   // ── Always-on service machinery ────────────────────────────
@@ -1168,9 +1204,6 @@ export function createBridge(cfg: BridgeConfig) {
 
   /** Jobs from a PREVIOUS bridge process whose provider is still alive: reattached, watched by the sweep. */
   const reattachWatch = new Map<string, number>();
-  // Every board name below resolves through board-map.json — never hard-coded.
-  const S = boardMap.statusOptions;
-  const ACTIVE_BOARD_STATUSES = [S.ready_for_dev, S.in_progress, S.planning, S.hold, S.rework];
 
   /**
    * Crash/reboot recovery over every persisted non-terminal job. Jobs owned by
@@ -1207,14 +1240,6 @@ export function createBridge(cfg: BridgeConfig) {
   }
 
   async function recoverDeadJob(job: JobRecord, reason: string): Promise<void> {
-    // Never resume a job the board has since moved out of an active state.
-    if (cfg.boardClient && job.page_id && !job.page_id.startsWith("plan-")) {
-      const boardStatus = await cfg.boardClient.getStatus(job.page_id).catch(() => null);
-      if (boardStatus && !ACTIVE_BOARD_STATUSES.includes(boardStatus)) {
-        fail(job.task_id, `interrupted job not resumed: the board card has moved to '${boardStatus}'`);
-        return;
-      }
-    }
     if (job.state === "planning") { // plans are cheap and read-only — just re-plan
       console.error(`[RECOVERY] (${reason}) ${job.task_id}: dead plan job — re-planning`);
       store.update(job.task_id, { started_at: Date.now(), last_heartbeat: Date.now(), error: null });
@@ -1234,121 +1259,56 @@ export function createBridge(cfg: BridgeConfig) {
     runJob(job.task_id, { resume }).catch((e: any) => fail(job.task_id, `recovery relaunch failed: ${e.message}`));
   }
 
-  // ── Board self-scan: the board IS the durable queue; pick cards up within
-  //    seconds of being awake instead of waiting for the cloud agent's pulse.
-  const scanInflight = new Set<string>();
-  let scanning = false;
-  let lastSelfScanAt: number | null = null;
-  const SCAN_STATUSES = [S.ready_for_dev, S.in_progress, S.hold, S.approved];
-
-  /**
-   * The SINGLE write path: MCP tools (cloud-agent-triggered) and the self-scan
-   * both act through startTask/mergeTask + the SQLite store, so the two
-   * triggers can never double-dispatch or fight over a status. Machine-side
-   * transitions only — the bridge NEVER flips a human gate
-   * (todo / ready_for_dev / approved).
-   */
-  async function reconcileCard(client: BoardClient, card: BoardCard): Promise<string | null> {
-    const job = store.getByPageId(card.pageId) ?? store.getByTaskId(slugifyTaskId(card.taskId));
-    switch (card.status) {
-      case S.ready_for_dev: {
-        if (!card.repoPath || !card.brief) return null; // incomplete card — a human's problem, never guessed
-        const cardMode: TaskMode = card.mode === boardMap.modeOptions.accept_edits ? "accept_edits"
-          : card.mode === boardMap.modeOptions.auto ? "auto" : defaultMode;
-        const r = await startTask({ taskId: card.taskId, pageId: card.pageId, repoPath: card.repoPath, brief: card.brief, codingAgent: card.codingAgent || undefined, verifyCommand: card.verifyCommand, mode: cardMode });
-        if (r.alreadyRunning) { await client.setStatus(card.pageId, S.in_progress); return "dedup: already dispatched (card flipped)"; }
-        if (r.state === "in_progress") {
-          await client.setStatus(card.pageId, S.in_progress);
-          await client.comment(card.pageId, `Bridge self-scan dispatched to ${r.provider} (${cardMode}) on branch ${r.branch}.`);
-          return "dispatched";
-        }
-        if (r.error === "capacityExceeded") return "capacity full — left in place";
-        if (r.error === "invalidRepo") { await client.comment(card.pageId, `Bridge: invalid repo — ${r.reason}`); return "invalidRepo commented"; }
-        return r.error ?? null;
-      }
-      case S.approved: {
-        if (!job) return "approved card has no job — left for the cloud agent";
-        const m = await mergeTask(job.task_id, "merge");
-        if (m.merged) {
-          await client.setStatus(card.pageId, S.merged);
-          await client.comment(card.pageId, `Merged as ${m.mergeCommit} (branch ${m.branchKept} kept for the revert window).`);
-          return "merged";
-        }
-        if (m.conflict) {
-          await client.setStatus(card.pageId, S.rework);
-          await client.comment(card.pageId, `Merge conflict with the base branch: ${(m.conflictFiles ?? []).join(", ")}`);
-          return "conflict → rework";
-        }
-        return `merge refused: ${m.error ?? ""}`;
-      }
-      case S.in_progress:
-      case S.hold: {
-        if (!job) return null;
-        if (job.state === "in_review") {
-          await client.setStatus(card.pageId, S.in_review);
-          const where = job.pr_url ?? job.branch_url ?? `branch ${job.branch}${job.local_only ? " (built locally, not pushed — repo has no origin remote)" : ""}`;
-          await client.comment(card.pageId, `Ready for review: ${where}`);
-          return "→ in_review";
-        }
-        if (job.state === "failed") { await client.setStatus(card.pageId, S.failed); await client.comment(card.pageId, `Failed: ${truncate(job.error ?? "unknown error", 1200)}`); return "→ failed"; }
-        if (job.state === "hold" && card.status !== S.hold) {
-          await client.setStatus(card.pageId, S.hold);
-          await client.comment(card.pageId, job.hold_reason === "needs_input" ? `Needs input: ${job.question}` : `On hold (${job.hold_reason}): ${truncate(job.error ?? "", 800)}`);
-          return "→ hold";
-        }
-        if ((job.state === "in_progress" || job.state === "planning") && card.status === S.hold) { await client.setStatus(card.pageId, S.in_progress); return "resumed → in_progress"; }
-        return null;
-      }
-      default:
-        return null;
-    }
-  }
-
-  async function scanBoardOnce(trigger: string): Promise<{ scanned: number; actions: string[] }> {
-    const client = cfg.boardClient;
-    if (!client) return { scanned: 0, actions: [] };
-    if (scanning) return { scanned: 0, actions: ["skipped: previous scan still running"] };
-    scanning = true;
-    const actions: string[] = [];
+  // ── Queue: capacity overflow waits durably in SQLite and is dispatched
+  //    FIFO by the sweep / wake routine as slots free up.
+  let dispatching = false;
+  async function dispatchQueued(trigger: string): Promise<string[]> {
+    if (dispatching) return [];
+    dispatching = true;
+    const dispatched: string[] = [];
     try {
-      const cards = await client.fetchCards(SCAN_STATUSES);
-      lastSelfScanAt = Date.now();
-      for (const card of cards) {
-        if (scanInflight.has(card.pageId)) continue; // per-task lock — cloud agent + self-scan can't double-act
-        scanInflight.add(card.pageId);
+      for (const job of store.listQueued()) {
+        if (store.countRunning() >= cfg.maxConcurrentJobs) break;
+        const isPlan = job.pending_action === "queued_plan";
         try {
-          const act = await reconcileCard(client, card);
-          if (act) { actions.push(`${card.taskId}: ${act}`); console.error(`[SCAN] (${trigger}) ${card.taskId}: ${act}`); }
+          if (isPlan) {
+            store.update(job.task_id, { state: "planning", pending_action: null, started_at: Date.now(), last_heartbeat: Date.now() });
+            runPlanJob(job.task_id).catch((e: any) => fail(job.task_id, `queued plan failed to start: ${e.message}`));
+          } else {
+            const hadBuild = job.worktree_path !== "";
+            const worktree = hadBuild ? job.worktree_path : path.join(cfg.worktreeRoot, job.task_id);
+            const baseBranch = await detectMainBranch(job.repo_path);
+            await ensureWorktree({ repo_path: job.repo_path, branch: job.branch, worktree_path: worktree }, baseBranch, hadBuild);
+            store.update(job.task_id, { state: "in_progress", worktree_path: worktree, pending_action: null, started_at: Date.now(), last_heartbeat: Date.now() });
+            runJob(job.task_id).catch((e: any) => fail(job.task_id, `queued build failed to start: ${e.message}`));
+          }
+          dispatched.push(job.task_id);
+          console.error(`[QUEUE] (${trigger}) dispatched ${job.task_id} (${isPlan ? "plan" : "build"})`);
         } catch (e: any) {
-          console.error(`[SCAN] (${trigger}) ${card.taskId}: ${e.message}`);
-        } finally {
-          scanInflight.delete(card.pageId);
+          fail(job.task_id, `queued dispatch failed: ${e.message}`);
         }
       }
       updatePower();
-      return { scanned: cards.length, actions };
-    } catch (e: any) {
-      console.error(`[SCAN] (${trigger}) board query failed: ${e.message}`);
-      return { scanned: 0, actions: [`error: ${e.message}`] };
+      return dispatched;
     } finally {
-      scanning = false;
+      dispatching = false;
     }
   }
 
-  // ── Wake routine: reconnect tunnel → reconcile in-flight jobs → self-scan ──
+  // ── Wake routine: verify tunnel → reconcile in-flight jobs → drain the queue ──
   let lastWakeAt: number | null = null;
   async function triggerWake(gapMs = 0): Promise<any> {
     lastWakeAt = Date.now();
-    console.error(`[WAKE] wake routine${gapMs ? ` (slept ~${Math.round(gapMs / 1000)}s)` : ""}: tunnel → reconcile → self-scan`);
+    console.error(`[WAKE] wake routine${gapMs ? ` (slept ~${Math.round(gapMs / 1000)}s)` : ""}: tunnel → reconcile → dispatch queue`);
     await checkTunnel("wake");
     const recovery = await recoverJobs("wake");
-    const scan = await scanBoardOnce("wake");
-    return { lastWakeAt, tunnel, recovery, scan };
+    const dispatched = await dispatchQueued("wake");
+    return { lastWakeAt, tunnel, recovery, dispatched };
   }
 
   /** Copy-truncate rotation for the launchd service logs (launchd keeps the fd open, so rename-rotation won't work). */
   async function rotateServiceLogs(): Promise<void> {
-    const dir = path.join(os.homedir(), ".build-board", "logs");
+    const dir = path.join(os.homedir(), ".bridge", "logs");
     if (!existsSync(dir)) return;
     try {
       for (const f of await readdir(dir)) {
@@ -1431,25 +1391,19 @@ export function createBridge(cfg: BridgeConfig) {
       await git(job.repo_path, ["worktree", "prune"]).catch(() => {});
       store.update(job.task_id, { cleaned_at: now });
     }
+    await dispatchQueued("sweep");
     updatePower();
     await rotateServiceLogs();
   }
 
   let wakeDetector: WakeDetector | null = null;
-  let selfScanTimer: NodeJS.Timeout | null = null;
 
   function startSweeps(intervalMs = 60000): NodeJS.Timeout {
     const timer = setInterval(() => { sweep().catch(e => console.error("[BRIDGE] sweep error:", e.message)); }, intervalMs);
     timer.unref();
-    // Wake detection (monotonic-clock gap): wake → tunnel check → reconcile → self-scan.
+    // Wake detection (monotonic-clock gap): wake → tunnel check → reconcile → drain queue.
     wakeDetector = new WakeDetector(cfg.wakeGapMs, (gap) => { triggerWake(gap).catch(e => console.error("[WAKE] wake routine error:", e.message)); });
     wakeDetector.start();
-    // Board self-scan: startup + short interval while awake.
-    if (cfg.boardClient && cfg.selfScanIntervalMs > 0) {
-      selfScanTimer = setInterval(() => { scanBoardOnce("interval").catch(() => {}); }, cfg.selfScanIntervalMs);
-      selfScanTimer.unref();
-      scanBoardOnce("startup").catch(() => {});
-    }
     checkTunnel("startup").catch(() => {});
     return timer;
   }
@@ -1465,15 +1419,14 @@ export function createBridge(cfg: BridgeConfig) {
     startSweeps,
     // Always-on service surface
     triggerWake,
-    scanBoardOnce,
+    dispatchQueued,
     recoverNow: (reason = "manual") => recoverJobs(reason),
     ops: () => ({
       tunnel: { up: tunnel.up, url: tunnel.url, lastCheck: tunnel.lastCheck ? new Date(tunnel.lastCheck).toISOString() : null, monitored: !!cfg.tunnelCheck },
       lastWakeAt: lastWakeAt ? new Date(lastWakeAt).toISOString() : null,
-      lastSelfScanAt: lastSelfScanAt ? new Date(lastSelfScanAt).toISOString() : null,
-      selfScanEnabled: !!cfg.boardClient,
       powerAssertionHeld: power.isHeld(),
       activeJobs: store.countRunning(),
+      queueDepth: store.countQueued(),
       reattachedJobs: [...reattachWatch.keys()],
       resumeStrategy: cfg.resumeStrategy,
     }),
@@ -1483,7 +1436,6 @@ export function createBridge(cfg: BridgeConfig) {
     close: () => {
       for (const [tid] of activePlanSessions) closePlanSession(tid);
       wakeDetector?.stop();
-      if (selfScanTimer) clearInterval(selfScanTimer);
       power.release();
       store.close();
     },

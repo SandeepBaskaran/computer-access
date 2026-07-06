@@ -42,7 +42,7 @@ async function boot() {
   try {
     // 2. Start Ngrok Tunnel
     // Ngrok is required to pipe the local localhost:8123 environment directly into the
-    // SSE stream required by Cloud-based AI Agents (like Notion or Claude Web).
+    // SSE stream required by cloud-based MCP clients.
     console.log("📡 Initializing Ngrok HTTPS tunnel...");
     
     // Attempt automatic discovery of ngrok authtoken if not explicitly provided in .env
@@ -76,7 +76,7 @@ async function boot() {
     console.log(`\n==================================================`);
     console.log(`✅ COMPUTER ACCESS MCP READY`);
     console.log(`==================================================\n`);
-    console.log(`🔗 CONNECTION URL (Paste into Notion Custom Agent):`);
+    console.log(`🔗 CONNECTION URL (paste into your MCP client's connector settings):`);
     console.log(`\x1b[36m${url}/sse\x1b[0m\n`);
     
     if (process.env.MCP_TOKEN) {

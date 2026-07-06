@@ -1,21 +1,22 @@
 /**
- * Durable job store for the Build Board bridge.
+ * Durable job store for the build bridge.
  *
  * SQLite (better-sqlite3, same lib as db-manage) so job state survives
  * process restarts — the in-memory task map is fine for ad-hoc shell jobs
- * but board tasks must be recoverable across bridge/machine reboots.
+ * but bridge jobs must be recoverable across bridge/machine reboots.
  */
 import Database from "better-sqlite3";
 import { mkdirSync } from "fs";
 import path from "path";
 
-export type JobState = "in_progress" | "in_review" | "merged" | "failed" | "reverted" | "hold" | "cancelled" | "planning" | "planned";
+export type JobState = "in_progress" | "in_review" | "merged" | "failed" | "reverted" | "hold" | "cancelled" | "planning" | "planned" | "queued";
 
 export type HoldReason = "needs_input" | "quota" | "session" | "blocked";
 
 export interface JobRecord {
   task_id: string;
-  page_id: string;
+  /** Caller-supplied opaque jobId — the idempotency/dedup key. */
+  job_key: string;
   repo_path: string;
   branch: string;
   worktree_path: string;
@@ -41,8 +42,10 @@ export interface JobRecord {
   session_id: string | null;
   /** Execution posture: "auto" (full autonomy) | "accept_edits" (supervised, questions relayed). */
   mode: string | null;
-  /** Notion data source the card lives on — writebacks always target the right board. */
-  board_id: string | null;
+  /** Deferred work marker: "git_init" (awaiting permission) | "queued_build" | "queued_plan". */
+  pending_action: string | null;
+  /** Shortstat of the job branch vs the base branch, captured at review time. */
+  diff_stat: string | null;
   pid: number | null;
   last_heartbeat: number | null;
   created_at: number;
@@ -55,7 +58,7 @@ export interface JobRecord {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS jobs (
   task_id        TEXT PRIMARY KEY,
-  page_id        TEXT UNIQUE NOT NULL,
+  job_key        TEXT UNIQUE NOT NULL,
   repo_path      TEXT NOT NULL,
   branch         TEXT NOT NULL,
   worktree_path  TEXT NOT NULL,
@@ -77,7 +80,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   plan_complex   INTEGER,
   session_id     TEXT,
   mode           TEXT,
-  board_id       TEXT,
+  pending_action TEXT,
+  diff_stat      TEXT,
   pid            INTEGER,
   last_heartbeat INTEGER,
   created_at     INTEGER NOT NULL,
@@ -97,8 +101,10 @@ export class JobStore {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
-    // Migrate databases created before the hold-state columns existed.
-    for (const col of ["hold_reason TEXT", "prev_state TEXT", "question TEXT", "hold_since INTEGER", "plan TEXT", "plan_provider TEXT", "plan_complex INTEGER", "session_id TEXT", "mode TEXT", "board_id TEXT"]) {
+    // Migrate databases created before the newer columns existed. (Pre-release
+    // databases with the old frontend-flavored dedup column must be deleted:
+    // rm data/jobs.sqlite — there is no migration for them.)
+    for (const col of ["hold_reason TEXT", "prev_state TEXT", "question TEXT", "hold_since INTEGER", "plan TEXT", "plan_provider TEXT", "plan_complex INTEGER", "session_id TEXT", "mode TEXT", "pending_action TEXT", "diff_stat TEXT"]) {
       try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${col}`); } catch { /* column already exists */ }
     }
   }
@@ -113,13 +119,13 @@ export class JobStore {
 
   insert(job: Omit<JobRecord, "created_at"> & { created_at?: number }): void {
     this.db.prepare(`
-      INSERT INTO jobs (task_id, page_id, repo_path, branch, worktree_path, provider, state, brief,
+      INSERT INTO jobs (task_id, job_key, repo_path, branch, worktree_path, provider, state, brief,
                         verify_command, pr_url, branch_url, merge_commit, error, local_only,
-                        hold_reason, prev_state, question, hold_since, plan, plan_provider, plan_complex, session_id, mode, board_id, pid, last_heartbeat,
+                        hold_reason, prev_state, question, hold_since, plan, plan_provider, plan_complex, session_id, mode, pending_action, diff_stat, pid, last_heartbeat,
                         created_at, started_at, finished_at, merged_at, cleaned_at)
-      VALUES (@task_id, @page_id, @repo_path, @branch, @worktree_path, @provider, @state, @brief,
+      VALUES (@task_id, @job_key, @repo_path, @branch, @worktree_path, @provider, @state, @brief,
               @verify_command, @pr_url, @branch_url, @merge_commit, @error, @local_only,
-              @hold_reason, @prev_state, @question, @hold_since, @plan, @plan_provider, @plan_complex, @session_id, @mode, @board_id, @pid, @last_heartbeat,
+              @hold_reason, @prev_state, @question, @hold_since, @plan, @plan_provider, @plan_complex, @session_id, @mode, @pending_action, @diff_stat, @pid, @last_heartbeat,
               @created_at, @started_at, @finished_at, @merged_at, @cleaned_at)
     `).run({ created_at: Date.now(), ...job });
   }
@@ -141,9 +147,20 @@ export class JobStore {
     return this.db.prepare("SELECT * FROM jobs WHERE task_id = ?").get(taskId) as JobRecord | undefined;
   }
 
-  getByPageId(pageId: string): JobRecord | undefined {
+  getByJobKey(jobKey: string): JobRecord | undefined {
     if (!this.isOpen) return undefined;
-    return this.db.prepare("SELECT * FROM jobs WHERE page_id = ?").get(pageId) as JobRecord | undefined;
+    return this.db.prepare("SELECT * FROM jobs WHERE job_key = ?").get(jobKey) as JobRecord | undefined;
+  }
+
+  /** Queued jobs in FIFO order — dispatched by the sweep as capacity frees up. */
+  listQueued(): JobRecord[] {
+    if (!this.isOpen) return [];
+    return this.db.prepare("SELECT * FROM jobs WHERE state = 'queued' ORDER BY created_at ASC").all() as JobRecord[];
+  }
+
+  countQueued(): number {
+    if (!this.isOpen) return 0;
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE state = 'queued'").get() as { n: number }).n;
   }
 
   listRecent(limit = 50): JobRecord[] {

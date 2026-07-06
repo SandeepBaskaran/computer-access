@@ -12,12 +12,12 @@
   ],
   "claude-code": {
     "command": "claude",
-    "buildArgs": [
+    "buildAutoArgs": [
       "-p",
       "{brief}",
       "--dangerously-skip-permissions"
     ],
-    "acceptEditsArgs": [
+    "buildAcceptEditsArgs": [
       "-p",
       "{brief}",
       "--permission-mode",
@@ -40,12 +40,12 @@
   },
   "codex": {
     "command": "codex",
-    "buildArgs": [
+    "buildAutoArgs": [
       "exec",
       "--dangerously-bypass-approvals-and-sandbox",
       "{brief}"
     ],
-    "acceptEditsArgs": [
+    "buildAcceptEditsArgs": [
       "exec",
       "--full-auto",
       "{brief}"
@@ -61,12 +61,12 @@
   },
   "opencode": {
     "command": "opencode",
-    "buildArgs": [
+    "buildAutoArgs": [
       "run",
       "--dangerously-skip-permissions",
       "{brief}"
     ],
-    "acceptEditsArgs": [
+    "buildAcceptEditsArgs": [
       "run",
       "{brief}"
     ],
@@ -87,14 +87,14 @@
   },
   "antigravity-agy": {
     "command": "agy",
-    "buildArgs": [
+    "buildAutoArgs": [
       "-p",
       "{brief}",
       "--dangerously-skip-permissions",
       "--print-timeout",
       "2h"
     ],
-    "acceptEditsArgs": [
+    "buildAcceptEditsArgs": [
       "-p",
       "{brief}",
       "--print-timeout",
@@ -118,14 +118,14 @@
   },
   "github-copilot-cli": {
     "command": "copilot",
-    "buildArgs": [
+    "buildAutoArgs": [
       "-p",
       "{brief}",
       "--allow-all-tools",
       "--allow-all-paths",
       "--no-ask-user"
     ],
-    "acceptEditsArgs": [
+    "buildAcceptEditsArgs": [
       "-p",
       "{brief}"
     ],
@@ -145,13 +145,13 @@
   },
   "grok-build": {
     "command": "grok",
-    "buildArgs": [
+    "buildAutoArgs": [
       "-p",
       "{brief}",
       "--permission-mode",
       "bypassPermissions"
     ],
-    "acceptEditsArgs": [
+    "buildAcceptEditsArgs": [
       "-p",
       "{brief}",
       "--permission-mode",

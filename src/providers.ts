@@ -1,5 +1,5 @@
 /**
- * Provider registry for the Build Board bridge.
+ * Provider registry for the build bridge.
  *
  * Adapters are data, not code: each entry in providers.json describes how to
  * invoke one coding-agent CLI in two modes:
@@ -26,7 +26,7 @@ export interface ProviderEntry {
   /** AUTO-mode build args ({brief}/{workspace} placeholders): full autonomy, skip-permissions posture. */
   buildArgs: string[];
   /** ACCEPT-EDITS build args: edits auto-applied, higher-risk actions (shell/installs/deletes/network)
-   *  pause — the supervised pty session relays the CLI's question to the board. */
+   *  pause — the supervised pty session relays the CLI's question to the caller. */
   acceptEditsArgs?: string[];
   /** Primary plan capability. Omitted + planArgs present → "headless" (back-compat). */
   planMode?: PlanMode;
@@ -72,6 +72,9 @@ function assertStringArray(name: string, field: string, v: any): void {
 function validateEntry(name: string, raw: any): ProviderEntry {
   if (!raw || typeof raw !== "object") throw new Error(`provider '${name}': entry must be an object`);
   if (typeof raw.command !== "string") throw new Error(`provider '${name}': 'command' must be a string`);
+  // Canonical key names are buildAutoArgs / buildAcceptEditsArgs; the old
+  // buildArgs / acceptEditsArgs spellings are accepted as aliases.
+  raw = { ...raw, buildArgs: raw.buildArgs ?? raw.buildAutoArgs, acceptEditsArgs: raw.acceptEditsArgs ?? raw.buildAcceptEditsArgs };
   assertStringArray(name, "buildArgs", raw.buildArgs);
   if (raw.acceptEditsArgs !== undefined) assertStringArray(name, "acceptEditsArgs", raw.acceptEditsArgs);
   if (raw.planArgs !== undefined) assertStringArray(name, "planArgs", raw.planArgs);
