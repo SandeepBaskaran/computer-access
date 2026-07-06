@@ -150,7 +150,46 @@ export function classifyHold(output: string): { reason: HoldReason; question: st
   return null;
 }
 
+/**
+ * The bridge must not depend on HOW it was launched: an IDE terminal, launchd,
+ * or a bare shell may each have a starved PATH missing the dirs where coding
+ * CLIs actually live (~/.local/bin, homebrew, …). Augment PATH once so every
+ * child spawn (providers, git, gh, expect, caffeinate) resolves consistently.
+ */
+function augmentPath(): void {
+  const home = os.homedir();
+  const wellKnown = [
+    path.join(home, ".local", "bin"),
+    path.join(home, ".claude", "local"),
+    path.join(home, ".opencode", "bin"),
+    path.join(home, ".codex", "bin"),
+    path.join(home, ".bun", "bin"),
+    path.join(home, ".cargo", "bin"),
+    path.join(home, ".npm-global", "bin"),
+    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+  ];
+  const current = (process.env.PATH || "").split(":").filter(Boolean);
+  const added: string[] = [];
+  for (const dir of wellKnown) {
+    if (!current.includes(dir) && existsSync(dir)) { current.push(dir); added.push(dir); }
+  }
+  if (added.length) {
+    process.env.PATH = current.join(":");
+    console.error(`[BRIDGE] PATH augmented with: ${added.join(", ")}`);
+  }
+}
+
+/** Where an agent command actually resolves on the (augmented) PATH — null if nowhere. */
+function resolveOnPath(command: string): string | null {
+  if (command.includes("/")) return existsSync(command) ? command : null;
+  for (const dir of (process.env.PATH || "").split(":")) {
+    if (dir && existsSync(path.join(dir, command))) return path.join(dir, command);
+  }
+  return null;
+}
+
 export function createBridge(cfg: BridgeConfig) {
+  augmentPath();
   const defaultMode: TaskMode = cfg.defaultMode ?? "auto";
   const allowPackageInstalls = cfg.allowPackageInstalls ?? true;
   const logsDir = path.join(cfg.dataDir, "logs");
@@ -159,6 +198,17 @@ export function createBridge(cfg: BridgeConfig) {
 
   let registry: ProviderRegistry = new Map();
   const registryReady = loadProviders(cfg.registryPath).then(r => { registry = r; });
+  // Boot preflight: say plainly which agents are actually launchable, so a
+  // missing binary shows up at startup instead of as a failed job later.
+  registryReady.then(() => {
+    const lines = [...registry.entries()]
+      .filter(([, e]) => !isStub(e))
+      .map(([name, e]) => {
+        const at = resolveOnPath(e.command);
+        return `${name} ${at ? `✓ (${at})` : "✗ NOT FOUND on PATH"}`;
+      });
+    if (lines.length) console.error(`[BRIDGE] agent preflight: ${lines.join(" · ")}`);
+  }).catch(() => {});
   // Boot recovery is smart, not blanket-fail: alive orphans reattach, dead
   // ones follow RESUME_STRATEGY (see recoverJobs below).
   registryReady.then(() => recoverJobs("boot")).then(() => dispatchQueued("boot")).catch(e => console.error("[RECOVERY] boot recovery error:", e.message));
