@@ -126,6 +126,17 @@ async function isWorkingTreeClean(repoDir: string): Promise<boolean> {
   return stdout.trim() === "";
 }
 
+/**
+ * Merge-guard variant: only TRACKED modifications count as dirty. Untracked
+ * junk (.DS_Store, editor droppings) must not block a merge — the guard
+ * protects uncommitted work, and a genuine untracked-file collision is still
+ * caught by git itself during the merge (surfaced via the conflict path).
+ */
+async function hasUncommittedTrackedChanges(repoDir: string): Promise<boolean> {
+  const { stdout } = await git(repoDir, ["status", "--porcelain", "--untracked-files=no"]);
+  return stdout.trim() !== "";
+}
+
 function truncate(s: string, cap = ERROR_CAP): string {
   return s.length > cap ? `…(truncated)…\n${s.slice(-cap)}` : s;
 }
@@ -1161,8 +1172,8 @@ export function createBridge(cfg: BridgeConfig) {
     if (!job) return { merged: false, error: "notFound", jobId };
 
     const repo = job.repo_path;
-    if (!(await isWorkingTreeClean(repo))) {
-      return { merged: false, error: "dirtyWorkingTree", message: `Working tree at ${repo} has uncommitted changes — refusing to ${action}.` };
+    if (await hasUncommittedTrackedChanges(repo)) {
+      return { merged: false, error: "dirtyWorkingTree", message: `Working tree at ${repo} has uncommitted changes to tracked files — refusing to ${action}. (Untracked files like .DS_Store don't count.)` };
     }
     const mainBranch = await detectMainBranch(repo);
     const { stdout: headOut } = await git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]);

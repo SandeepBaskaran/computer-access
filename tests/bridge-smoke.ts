@@ -171,18 +171,21 @@ async function main() {
   assert(gitOut(bare1, ["branch", "--list", "job/101"]).includes("job/101"), "branch pushed to bare origin");
   assert(typeof s1.logExcerpt === "string" && s1.logExcerpt.includes("work done"), "getJobStatus returns log excerpt");
 
-  // merge refusal on dirty tree
-  writeFileSync(path.join(repo1, "dirty.txt"), "uncommitted");
+  // merge refusal on dirty tree — TRACKED modifications block…
+  writeFileSync(path.join(repo1, "README.md"), "# repo1 — locally modified\n");
   const mDirty = await bridge.mergeTask("101");
-  assert(mDirty.merged === false && mDirty.error === "dirtyWorkingTree", "merge refused on dirty working tree", JSON.stringify(mDirty));
-  rmSync(path.join(repo1, "dirty.txt"));
+  assert(mDirty.merged === false && mDirty.error === "dirtyWorkingTree", "merge refused when a TRACKED file is modified", JSON.stringify(mDirty));
+  sh(repo1, "git", ["checkout", "--", "README.md"]);
+  // …but untracked junk (.DS_Store & friends) must NOT block the merge below
+  writeFileSync(path.join(repo1, ".DS_Store"), "macos junk");
+  writeFileSync(path.join(repo1, "scratch-note.txt"), "untracked");
 
   // merge refusal on wrong state (fresh unknown task)
   const mUnknown = await bridge.mergeTask("999");
   assert(mUnknown.merged === false && mUnknown.error === "notFound", "merge of unknown task refused");
 
   const m1 = await bridge.mergeTask("101");
-  assert(m1.merged === true && !!m1.mergeCommit, "merge succeeds", JSON.stringify(m1));
+  assert(m1.merged === true && !!m1.mergeCommit, "merge succeeds despite untracked .DS_Store present", JSON.stringify(m1));
   const parents = gitOut(repo1, ["rev-list", "--parents", "-n", "1", m1.mergeCommit]).split(" ");
   assert(parents.length === 3, "--no-ff produced a real merge commit (2 parents)");
   assert(gitOut(bare1, ["rev-parse", "main"]) === m1.mergeCommit, "main pushed to origin");
