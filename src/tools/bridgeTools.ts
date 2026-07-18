@@ -65,7 +65,7 @@ const json = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.st
 export function registerBridgeTools(register: Register, sessionId: string) {
   register("start", {
     title: "Bridge: Start Build Job",
-    description: "Dispatch a build job to a local coding-agent CLI. Creates an isolated git worktree on branch job/<jobId> (or the given branch), runs the agent asynchronously, and returns immediately. On success the branch is committed, pushed, and a PR/compare URL is recorded (state: in_review). Structured returns: alreadyRunning (idempotent on jobId), queued (capacity full — dispatched FIFO as slots free), invalidRepo, awaiting_input (directory has no git repo — reply via `answer` to authorize `git init`). Re-calling for a failed/in_review job re-runs on the same branch/worktree with the new prompt.",
+    description: "Dispatch a build job to a local coding-agent CLI. Creates an isolated git worktree on branch job/<jobId> (or the given branch), runs the agent asynchronously, and returns immediately. On success the work is committed LOCALLY on the job branch and the job ends in_review with a diffStat — nothing is pushed and no PR is opened until the human approves and `merge` delivers it. Structured returns: alreadyRunning (idempotent on jobId), queued (capacity full — dispatched FIFO as slots free), invalidRepo, awaiting_input (directory has no git repo — reply via `answer` to authorize `git init`). Re-calling for a failed/in_review job re-runs on the same branch/worktree with the new prompt.",
     inputSchema: {
       jobId: z.string().describe("Opaque caller-supplied id — the idempotency/dedup key; also derives branch job/<jobId>"),
       repoPath: z.string().describe("Absolute path to the target directory (must be inside ALLOWED_DIRS)"),
@@ -109,7 +109,7 @@ export function registerBridgeTools(register: Register, sessionId: string) {
 
   register("get_status", {
     title: "Bridge: Job Status",
-    description: "Durable job state, always as an ARRAY. With jobId: one entry with full detail including a log excerpt. Without: the 50 most recent jobs. States: planning | planned | queued | running | awaiting_input (see `question`) | paused (see `pausedReason`: quota auto-retries; session/blocked need a human) | in_review (see prUrl/branchUrl/diffStat) | failed | merged | cancelled. Survives bridge restarts.",
+    description: "Durable job state, always as an ARRAY. With jobId: one entry with full detail including a log excerpt. Without: the 50 most recent jobs. States: planning | planned | queued | running | awaiting_input (see `question`) | paused (see `pausedReason`: quota auto-retries; session/blocked need a human) | in_review (work kept local — see diffStat) | failed | merged (see deliveryMode: 'merge' pushed main, 'pr' opened prUrl) | cancelled. Survives bridge restarts.",
     inputSchema: {
       jobId: z.string().optional().describe("Job id; omit to list recent jobs"),
     },
@@ -162,7 +162,7 @@ export function registerBridgeTools(register: Register, sessionId: string) {
 
   register("merge", {
     title: "Bridge: Merge Job",
-    description: "Merge a reviewed job into the default branch with --no-ff and push. Refuses unless the job is in_review and no tracked files have uncommitted changes (untracked junk like .DS_Store never blocks). The branch is KEPT for the revert window; the worktree is removed. On conflict returns {merged:false, conflict:true} with everything intact. action:'revert' reverts a merged job's merge commit within the revert window (operator use).",
+    description: "Deliver a reviewed (in_review) job — ownership decides the mode, not push capability. Owned/administered repo → 'merge': sync main (--ff-only), rebase the job branch, --no-ff merge, push ONLY main, delete the branch immediately. Anyone else's repo (even with write access) → 'pr': rebase on origin main, push the BRANCH (origin or fork), open a real PR via gh with the repo's PR template filled ({deliveredVia:'pr', prUrl}); branch + worktree are kept while the PR is open. A .bridge.json {\"deliver\":\"merge\"|\"pr\"} override wins. Refuses on uncommitted tracked changes. Structured failures: {conflict:true, conflictFiles} (re-dispatch the agent to reconcile), mainDiverged, ghUnauthenticated. action:'revert' reverts a merge-mode delivery's merge commit within REVERT_WINDOW_HOURS (operator use); pr-mode deliveries are reverted upstream.",
     inputSchema: {
       jobId: z.string().describe("Job id to merge"),
       action: z.enum(["merge", "revert"]).optional().describe("Default: merge"),

@@ -46,6 +46,8 @@ export interface JobRecord {
   pending_action: string | null;
   /** Shortstat of the job branch vs the base branch, captured at review time. */
   diff_stat: string | null;
+  /** How the work leaves the machine, resolved at merge time: "merge" (owned repo) | "pr" (someone else's). */
+  delivery_mode: string | null;
   pid: number | null;
   last_heartbeat: number | null;
   created_at: number;
@@ -82,6 +84,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   mode           TEXT,
   pending_action TEXT,
   diff_stat      TEXT,
+  delivery_mode  TEXT,
   pid            INTEGER,
   last_heartbeat INTEGER,
   created_at     INTEGER NOT NULL,
@@ -112,7 +115,7 @@ export class JobStore {
     this.db.exec(SCHEMA);
     // Migrate columns added AFTER the job_key rename. Anything older is
     // caught by the schema guard above, so pre-rename columns need no ALTERs.
-    for (const col of ["hold_reason TEXT", "prev_state TEXT", "question TEXT", "hold_since INTEGER", "plan TEXT", "plan_provider TEXT", "plan_complex INTEGER", "session_id TEXT", "mode TEXT", "pending_action TEXT", "diff_stat TEXT"]) {
+    for (const col of ["hold_reason TEXT", "prev_state TEXT", "question TEXT", "hold_since INTEGER", "plan TEXT", "plan_provider TEXT", "plan_complex INTEGER", "session_id TEXT", "mode TEXT", "pending_action TEXT", "diff_stat TEXT", "delivery_mode TEXT"]) {
       try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${col}`); } catch { /* column already exists */ }
     }
   }
@@ -129,11 +132,11 @@ export class JobStore {
     this.db.prepare(`
       INSERT INTO jobs (task_id, job_key, repo_path, branch, worktree_path, provider, state, brief,
                         verify_command, pr_url, branch_url, merge_commit, error, local_only,
-                        hold_reason, prev_state, question, hold_since, plan, plan_provider, plan_complex, session_id, mode, pending_action, diff_stat, pid, last_heartbeat,
+                        hold_reason, prev_state, question, hold_since, plan, plan_provider, plan_complex, session_id, mode, pending_action, diff_stat, delivery_mode, pid, last_heartbeat,
                         created_at, started_at, finished_at, merged_at, cleaned_at)
       VALUES (@task_id, @job_key, @repo_path, @branch, @worktree_path, @provider, @state, @brief,
               @verify_command, @pr_url, @branch_url, @merge_commit, @error, @local_only,
-              @hold_reason, @prev_state, @question, @hold_since, @plan, @plan_provider, @plan_complex, @session_id, @mode, @pending_action, @diff_stat, @pid, @last_heartbeat,
+              @hold_reason, @prev_state, @question, @hold_since, @plan, @plan_provider, @plan_complex, @session_id, @mode, @pending_action, @diff_stat, @delivery_mode, @pid, @last_heartbeat,
               @created_at, @started_at, @finished_at, @merged_at, @cleaned_at)
     `).run({ created_at: Date.now(), ...job });
   }
@@ -187,12 +190,12 @@ export class JobStore {
     return this.db.prepare("SELECT * FROM jobs WHERE state IN ('in_progress', 'planning')").all() as JobRecord[];
   }
 
-  /** Merged jobs past the revert window whose branches haven't been cleaned yet. */
-  listMergedForCleanup(mergedBefore: number): JobRecord[] {
+  /** PR-delivered jobs whose branch + worktree back a still-open PR; the sweep polls the PR state and cleans on MERGED/CLOSED. */
+  listPrDeliveredForCleanup(): JobRecord[] {
     if (!this.isOpen) return [];
     return this.db.prepare(
-      "SELECT * FROM jobs WHERE state = 'merged' AND cleaned_at IS NULL AND merged_at IS NOT NULL AND merged_at < ?"
-    ).all(mergedBefore) as JobRecord[];
+      "SELECT * FROM jobs WHERE state = 'merged' AND delivery_mode = 'pr' AND pr_url IS NOT NULL AND cleaned_at IS NULL"
+    ).all() as JobRecord[];
   }
 
   /** Held jobs eligible for auto-retry (only transient reasons; held longer than the retry delay). */

@@ -5,7 +5,8 @@
  *
  *   startTask     — async dispatch of a coding-agent CLI in an isolated worktree
  *   getJobStatus  — durable job state + log excerpt for the caller
- *   mergeTask     — gated --no-ff merge to main (or single-job revert)
+ *   mergeTask     — gated delivery: --no-ff merge to main on OWNED repos, a
+ *                   rebased branch + real PR on anyone else's (or single-job revert)
  *
  * Dependency-injected (isPathAllowed comes from server.ts) so the smoke test
  * can drive it directly without ngrok/express.
@@ -13,7 +14,7 @@
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
 import { createWriteStream, existsSync, mkdirSync } from "fs";
-import { readFile, stat, rm, readdir, copyFile, truncate as ftruncate } from "fs/promises";
+import { readFile, writeFile, appendFile, stat, rm, readdir, copyFile, truncate as ftruncate } from "fs/promises";
 import path from "path";
 import os from "os";
 import { JobStore, JobRecord, JobState, HoldReason } from "./jobs.js";
@@ -139,6 +140,117 @@ async function hasUncommittedTrackedChanges(repoDir: string): Promise<boolean> {
 
 function truncate(s: string, cap = ERROR_CAP): string {
   return s.length > cap ? `…(truncated)…\n${s.slice(-cap)}` : s;
+}
+
+/** Best human-readable text from a thrown exec/git error — stderr first, unknown-safe. */
+function errText(e: unknown): string {
+  if (e && typeof e === "object") {
+    const eo = e as { stderr?: unknown; message?: unknown };
+    if (typeof eo.stderr === "string" && eo.stderr.trim()) return eo.stderr.trim();
+    if (typeof eo.message === "string") return eo.message;
+  }
+  return String(e);
+}
+
+// ── Delivery modes ──────────────────────────────────────────
+// Nothing leaves the machine at build time; `merge` delivers. OWNERSHIP
+// decides the mode, not push capability: repos the user owns/administers
+// merge to main directly; anyone else's repo — even with write access —
+// gets a rebased branch push and a real PR.
+
+export type DeliveryMode = "merge" | "pr";
+
+const GH_TIMEOUT_MS = 15000;
+
+async function gh(repoDir: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileP("gh", args, { cwd: repoDir, timeout: GH_TIMEOUT_MS });
+  return stdout.trim();
+}
+
+/** GitHub viewer info for a repo, or null when gh is missing/unauthenticated/failing. */
+async function ghViewerInfo(repo: string): Promise<{ viewerPermission: string; ownerLogin: string } | null> {
+  try {
+    const parsed: unknown = JSON.parse(await gh(repo, ["repo", "view", "--json", "viewerPermission,owner"]));
+    if (!parsed || typeof parsed !== "object") return null;
+    const p = parsed as { viewerPermission?: unknown; owner?: unknown };
+    const login = p.owner && typeof p.owner === "object" ? (p.owner as { login?: unknown }).login : null;
+    return {
+      viewerPermission: typeof p.viewerPermission === "string" ? p.viewerPermission : "",
+      ownerLogin: typeof login === "string" ? login : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function ghUserLogin(repo: string): Promise<string | null> {
+  try { return (await gh(repo, ["api", "user", "--jq", ".login"])) || null; } catch { return null; }
+}
+
+/** Cheap PR-state poll; null when gh can't answer (missing, offline, unauthenticated). */
+async function ghPrState(repo: string, prUrl: string): Promise<string | null> {
+  try {
+    const parsed: unknown = JSON.parse(await gh(repo, ["pr", "view", prUrl, "--json", "state"]));
+    const state = parsed && typeof parsed === "object" ? (parsed as { state?: unknown }).state : null;
+    return typeof state === "string" ? state : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve how a merge-approved job leaves the machine:
+ *   1. `.bridge.json` `{"deliver": "merge" | "pr"}` in the repo root wins.
+ *   2. Else OWNERSHIP decides, not push capability: gh viewerPermission ADMIN,
+ *      or the authenticated gh user IS the repo owner → "merge".
+ *      MAINTAIN / WRITE / TRIAGE / READ / none → "pr" — a WRITE collaborator
+ *      who could technically push still goes through a PR.
+ *   3. gh missing/unauthenticated, or no origin → "merge" (a local merge still
+ *      works; a rejected main-push at delivery falls back to "pr" once).
+ */
+async function resolveDeliveryMode(repo: string, origin: string | null): Promise<{ mode: DeliveryMode; viewerPermission: string | null }> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path.join(repo, ".bridge.json"), "utf-8"));
+    const deliver = parsed && typeof parsed === "object" ? (parsed as { deliver?: unknown }).deliver : undefined;
+    if (deliver === "merge" || deliver === "pr") return { mode: deliver, viewerPermission: null };
+  } catch { /* no per-repo config */ }
+  if (!origin) return { mode: "merge", viewerPermission: null };
+  const info = await ghViewerInfo(repo);
+  if (!info) return { mode: "merge", viewerPermission: null };
+  if (info.viewerPermission === "ADMIN") return { mode: "merge", viewerPermission: info.viewerPermission };
+  const login = await ghUserLogin(repo);
+  if (login && info.ownerLogin && login === info.ownerLogin) return { mode: "merge", viewerPermission: info.viewerPermission };
+  return { mode: "pr", viewerPermission: info.viewerPermission || null };
+}
+
+/** PR template discovery, in the documented order; returns the template text or null. */
+async function findPrTemplate(worktree: string): Promise<string | null> {
+  for (const rel of [".github/PULL_REQUEST_TEMPLATE.md", "PULL_REQUEST_TEMPLATE.md", "docs/PULL_REQUEST_TEMPLATE.md"]) {
+    try { return await readFile(path.join(worktree, rel), "utf-8"); } catch { /* next candidate */ }
+  }
+  try {
+    const dir = path.join(worktree, ".github", "PULL_REQUEST_TEMPLATE");
+    const files = (await readdir(dir)).filter(f => f.toLowerCase().endsWith(".md")).sort();
+    const pick = files.find(f => f.toLowerCase() === "default.md") ?? files[0];
+    if (pick) return await readFile(path.join(dir, pick), "utf-8");
+  } catch { /* no template dir */ }
+  return null;
+}
+
+/** Run a command to completion capturing stdout, with a hard timeout (used for the PR-body one-shot). */
+function runCaptured(command: string, args: string[], opts: { cwd: string; env?: NodeJS.ProcessEnv; stdinData?: string; timeoutMs: number }): Promise<{ code: number | null; stdout: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, { cwd: opts.cwd, env: opts.env ?? process.env });
+    let out = "";
+    const timer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch { /* already gone */ } }, opts.timeoutMs);
+    proc.stdout.on("data", (chunk: Buffer) => { out += chunk.toString(); });
+    proc.stderr.on("data", () => { /* drained, discarded */ });
+    proc.stdin.on("error", () => { /* EPIPE from a CLI that never reads stdin */ });
+    if (opts.stdinData !== undefined) proc.stdin.write(opts.stdinData);
+    proc.stdin.end();
+    proc.on("error", (e) => { clearTimeout(timer); reject(e); });
+    proc.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout: out }); });
+  });
 }
 
 /**
@@ -308,6 +420,7 @@ export function createBridge(cfg: BridgeConfig) {
       prUrl: job.pr_url,
       branchUrl: job.branch_url,
       localOnly: job.local_only === 1,
+      deliveryMode: job.delivery_mode,
       mergeCommit: job.merge_commit,
       diffStat: job.diff_stat,
       error: job.error,
@@ -524,9 +637,11 @@ export function createBridge(cfg: BridgeConfig) {
     session.arm();
   }
 
-  /** Post-provider pipeline: verify → commit → empty-diff guard → push/PR → in_review.
-   *  Separate from runJob so a REATTACHED job (provider survived a bridge restart)
-   *  can finish the same way once its process exits. */
+  /** Post-provider pipeline: verify → commit → empty-diff guard → in_review.
+   *  Nothing leaves the machine at build time: the work stays committed on the
+   *  local job branch (localOnly) until the human approves and `merge` delivers
+   *  it. Separate from runJob so a REATTACHED job (provider survived a bridge
+   *  restart) can finish the same way once its process exits. */
   async function finishBuild(taskId: string): Promise<void> {
     const job = store.getByTaskId(taskId);
     if (!job || isCancelled(taskId)) return;
@@ -578,7 +693,7 @@ export function createBridge(cfg: BridgeConfig) {
       const { stdout: aheadOut } = await git(job.worktree_path, ["rev-list", "--count", `${baseBranch}..${job.branch}`]).catch(() => ({ stdout: "" } as any));
       if (aheadOut.trim() === "0") {
         store.update(taskId, {
-          state: "in_review", diff_stat: "", error: null,
+          state: "in_review", diff_stat: "", local_only: 1, error: null,
           hold_reason: null, prev_state: null, question: null, hold_since: null,
           finished_at: Date.now(), pid: null,
         });
@@ -589,44 +704,14 @@ export function createBridge(cfg: BridgeConfig) {
       diffStat = statOut.trim();
     }
 
-    // 4. Push + PR (graceful when the repo has no origin)
-    let prUrl: string | null = null;
-    let branchUrl: string | null = null;
-    let localOnly = false;
-    const origin = await hasOrigin(job.worktree_path);
-    if (origin) {
-      try {
-        await git(job.worktree_path, ["push", "-u", "origin", job.branch]);
-      } catch (e: any) {
-        // Never a silent success: park in hold with the exact push error;
-        // the commit stays local and the job is flagged localOnly.
-        hold(taskId, "blocked", "in_progress",
-          `Push of ${job.branch} failed (protected branch / non-fast-forward / auth?): ${truncate(e.stderr || e.message, 2000)}`,
-          null, { local_only: 1, finished_at: Date.now() });
-        return;
-      }
-      // PR creation must never fail the task.
-      try {
-        const { stdout } = await execFileP("gh", ["pr", "create", "--head", job.branch, "--title", commitMessage(job), "--body", job.brief], { cwd: job.worktree_path, timeout: 30000 });
-        prUrl = stdout.trim().split("\n").pop() || null;
-      } catch {
-        const webUrl = originToWebUrl(origin);
-        if (webUrl) {
-          const base = await detectMainBranch(job.worktree_path).catch(() => "main");
-          branchUrl = `${webUrl}/compare/${base}...${job.branch}`;
-        }
-      }
-      if (prUrl) branchUrl = prUrl;
-    } else {
-      localOnly = true;
-    }
-
-    if (isCancelled(taskId)) return; // cancel arrived while pushing — don't resurrect
+    // 4. Done — the work exists ONLY on this machine (local job branch).
+    // No push, no PR: delivery happens at merge time, after human approval.
+    if (isCancelled(taskId)) return; // cancel arrived during the diff capture — don't resurrect
     store.update(taskId, {
       state: "in_review",
-      pr_url: prUrl,
-      branch_url: branchUrl,
-      local_only: localOnly ? 1 : 0,
+      pr_url: null,
+      branch_url: null,
+      local_only: 1,
       diff_stat: diffStat,
       error: null,
       hold_reason: null, prev_state: null, question: null, hold_since: null,
@@ -663,7 +748,7 @@ export function createBridge(cfg: BridgeConfig) {
       branch: "", worktree_path: "", verify_command: null,
       pr_url: null, branch_url: null, merge_commit: null, error: null, local_only: null,
       plan: null, plan_provider: null, plan_complex: null, session_id: null, mode: null,
-      pending_action: null, diff_stat: null,
+      pending_action: null, diff_stat: null, delivery_mode: null,
       hold_reason: null, prev_state: null, question: null, hold_since: null,
       pid: null, last_heartbeat: now, created_at: now, started_at: now, finished_at: null, merged_at: null, cleaned_at: null,
       ...fields,
@@ -761,6 +846,7 @@ export function createBridge(cfg: BridgeConfig) {
 
   // ── Plan pipeline: headless where possible, pty-driven interactive where
   //    not, PLAN_FALLBACK_AGENT only when a plan mode can't be driven at all.
+  // eslint-disable-next-line no-control-regex -- matching terminal escape sequences IS the point
   const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Z0-9]|\r/g;
   const stripAnsi = (s: string) => s.replace(ANSI_RE, "");
   const UNDRIVABLE_RE = /unknown (?:flag|option)|flag provided but not defined|unrecognized (?:option|argument)|no such (?:option|flag)|invalid option|unexpected argument|command not found|no such file or directory/i;
@@ -1187,6 +1273,11 @@ export function createBridge(cfg: BridgeConfig) {
     };
 
     if (action === "revert") {
+      // Revert operates on the stored merge_commit — the branch is long gone
+      // and not needed. Only meaningful for "merge"-mode deliveries.
+      if (job.delivery_mode === "pr") {
+        return { merged: false, error: "prDelivery", message: "This job was delivered as a pull request — there is no local merge commit to revert. Revert the PR upstream instead." };
+      }
       if (job.state !== "merged" || !job.merge_commit) {
         return { merged: false, error: "invalidState", message: `Cannot revert a job in state '${job.state}' — only merged tasks can be reverted.` };
       }
@@ -1214,35 +1305,243 @@ export function createBridge(cfg: BridgeConfig) {
       return { merged: false, error: "invalidState", message: `Job is '${job.state}' — merge requires 'in_review'. Approval flows live with the caller; the bridge only checks the work actually finished.` };
     }
 
+    // OWNERSHIP decides the delivery mode, not push capability (see resolveDeliveryMode).
+    const { mode, viewerPermission } = await resolveDeliveryMode(repo, origin);
+    store.update(job.task_id, { delivery_mode: mode });
+
+    if (mode === "merge") {
+      const res = await deliverMerge(job, mainBranch, origin, restoreBranch);
+      switch (res.status) {
+        case "merged":
+          store.update(job.task_id, {
+            state: "merged", merge_commit: res.mergeCommit, merged_at: Date.now(),
+            cleaned_at: Date.now(), // branch + worktree already gone — nothing for the sweep
+            error: null,
+          });
+          return { merged: true, jobId: job.job_key, deliveredVia: "merge", mergeCommit: res.mergeCommit };
+        case "conflict":
+          // Worktree and branch stay intact — the caller decides what happens next.
+          return { merged: false, conflict: true, conflictFiles: res.conflictFiles };
+        case "mainPushRejected": {
+          // Protected branch / missing permission: main is already reset to
+          // origin/<main>, the branch and worktree still exist — fall back
+          // ONCE to a PR delivery.
+          const note = `[DELIVERY] push of ${mainBranch} rejected (${res.message.split("\n")[0]}) — falling back to pr mode`;
+          console.error(`[MERGE] ${job.task_id}: ${note}`);
+          await appendFile(logPath(job.task_id), `\n${note}\n`).catch(() => {});
+          store.update(job.task_id, { delivery_mode: "pr" });
+          return finishPrDelivery(job, await deliverPr(job, mainBranch, viewerPermission));
+        }
+        case "error":
+          return { merged: false, error: res.code, message: res.message };
+      }
+    }
+    return finishPrDelivery(job, await deliverPr(job, mainBranch, viewerPermission));
+  }
+
+  type MergeDeliveryResult =
+    | { status: "merged"; mergeCommit: string }
+    | { status: "conflict"; conflictFiles: string[] }
+    | { status: "mainPushRejected"; message: string }
+    | { status: "error"; code: "mainDiverged" | "fetchFailed"; message: string };
+
+  type PrDeliveryResult =
+    | { status: "pr"; prUrl: string }
+    | { status: "conflict"; conflictFiles: string[] }
+    | { status: "error"; code: "ghUnauthenticated" | "fetchFailed" | "forkFailed" | "pushFailed" | "prCreateFailed"; message: string };
+
+  /** Delivery mode "merge" (owned repo): sync main, rebase the job branch, --no-ff merge, push ONLY main, delete the branch immediately. */
+  async function deliverMerge(job: JobRecord, mainBranch: string, origin: string | null, restoreBranch: () => Promise<void>): Promise<MergeDeliveryResult> {
+    const repo = job.repo_path;
+    // 1. Sync local main with origin — fast-forward only, never guess, never force.
+    if (origin) {
+      try {
+        await git(repo, ["fetch", "origin"]);
+      } catch (e) {
+        return { status: "error", code: "fetchFailed", message: truncate(errText(e), 2000) };
+      }
+    }
     await git(repo, ["checkout", mainBranch]);
+    if (origin) {
+      try {
+        await git(repo, ["pull", "--ff-only", "origin", mainBranch]);
+      } catch (e) {
+        await restoreBranch();
+        return { status: "error", code: "mainDiverged", message: truncate(errText(e), 2000) };
+      }
+    }
+    // 2. Rebase the job branch onto main INSIDE the worktree (the branch is checked out there).
+    const rebased = await rebaseBranch(job, mainBranch, restoreBranch);
+    if (rebased) return rebased;
+    // 3. --no-ff merge into main.
     try {
       await git(repo, ["merge", "--no-ff", "--no-edit", job.branch]);
-    } catch (e: any) {
-      const { stdout: conflictsOut } = await git(repo, ["diff", "--name-only", "--diff-filter=U"]).catch(() => ({ stdout: "" } as any));
-      const conflictFiles = conflictsOut.trim().split("\n").filter(Boolean);
+    } catch (e) {
+      const conflictFiles = await conflictedFiles(repo);
       await git(repo, ["merge", "--abort"]).catch(() => {});
       await restoreBranch();
-      // Worktree and branch stay intact — the caller decides what happens next.
-      store.update(job.task_id, { error: `merge conflict with ${mainBranch}: ${conflictFiles.join(", ") || truncate(e.stderr || e.message, 500)}` });
-      return { merged: false, conflict: true, conflictFiles };
+      store.update(job.task_id, { error: `merge conflict with ${mainBranch}: ${conflictFiles.join(", ") || truncate(errText(e), 500)}` });
+      return { status: "conflict", conflictFiles };
     }
-
     const { stdout: shaOut } = await git(repo, ["rev-parse", "HEAD"]);
     const mergeCommit = shaOut.trim();
-    let pushFailed = false;
-    if (origin) await git(repo, ["push", "origin", mainBranch]).catch(() => { pushFailed = true; });
-    await restoreBranch();
-
-    // Worktree removed at merge; branch KEPT for the revert window.
+    // Push ONLY main — job branches never leave the machine in merge mode.
+    if (origin) {
+      try {
+        await git(repo, ["push", "origin", mainBranch]);
+      } catch (e) {
+        // The merge commit must not linger on a main we cannot push.
+        await git(repo, ["reset", "--hard", `origin/${mainBranch}`]).catch(() => {});
+        await restoreBranch();
+        return { status: "mainPushRejected", message: truncate(errText(e), 2000) };
+      }
+    }
+    // 4. Delivered — no retention window for branches. Worktree first (it holds the branch checkout).
     await git(repo, ["worktree", "remove", job.worktree_path]).catch(async () => {
       await git(repo, ["worktree", "remove", "--force", job.worktree_path]).catch(() => {});
     });
+    await git(repo, ["branch", "-D", job.branch]).catch(() => {});
+    await git(repo, ["worktree", "prune"]).catch(() => {});
+    await restoreBranch();
+    return { status: "merged", mergeCommit };
+  }
 
-    store.update(job.task_id, {
-      state: "merged", merge_commit: mergeCommit, merged_at: Date.now(),
-      error: pushFailed ? `merged locally but push of ${mainBranch} failed — push manually` : null,
-    });
-    return { merged: true, jobId: job.job_key, mergeCommit, branchKept: job.branch, ...(pushFailed ? { pushFailed } : {}) };
+  /** Delivery mode "pr" (someone else's repo): rebase on origin/<main>, push the BRANCH (origin or fork), open a real PR. Local main is never checked out or modified. */
+  async function deliverPr(job: JobRecord, mainBranch: string, viewerPermission: string | null): Promise<PrDeliveryResult> {
+    const repo = job.repo_path;
+    try {
+      await gh(repo, ["auth", "status"]);
+    } catch {
+      return { status: "error", code: "ghUnauthenticated", message: "gh is missing or not authenticated — run `gh auth login`" };
+    }
+    try {
+      await git(repo, ["fetch", "origin"]);
+    } catch (e) {
+      return { status: "error", code: "fetchFailed", message: truncate(errText(e), 2000) };
+    }
+    const rebased = await rebaseBranch(job, `origin/${mainBranch}`, async () => {});
+    if (rebased) return rebased;
+    // Push the branch: straight to origin when the viewer can push branches;
+    // otherwise via a fork (created once, idempotent). Never main.
+    const canPushOrigin = viewerPermission === null || ["ADMIN", "MAINTAIN", "WRITE"].includes(viewerPermission);
+    let headRef = job.branch;
+    let pushRemote = "origin";
+    if (!canPushOrigin) {
+      const forkExists = await git(repo, ["remote", "get-url", "fork"]).then(() => true).catch(() => false);
+      if (!forkExists) {
+        try {
+          await gh(job.worktree_path, ["repo", "fork", "--remote", "--remote-name", "fork"]);
+        } catch (e) {
+          return { status: "error", code: "forkFailed", message: truncate(errText(e), 2000) };
+        }
+      }
+      pushRemote = "fork";
+      const login = await ghUserLogin(repo);
+      if (login) headRef = `${login}:${job.branch}`;
+    }
+    try {
+      // force-with-lease: the rebase rewrote history; a stale remote branch from a prior delivery must not block it.
+      await git(job.worktree_path, ["push", "--force-with-lease", "-u", pushRemote, job.branch]);
+    } catch (e) {
+      return { status: "error", code: "pushFailed", message: truncate(errText(e), 2000) };
+    }
+    const template = await findPrTemplate(job.worktree_path);
+    const body = (template ? await fillPrTemplate(job, template, mainBranch) : null) ?? await fallbackPrBody(job, mainBranch);
+    const bodyFile = path.join(logsDir, `${job.task_id}.pr-body.md`);
+    await writeFile(bodyFile, body, "utf-8");
+    try {
+      const out = await gh(job.worktree_path, ["pr", "create", "--head", headRef, "--title", commitMessage(job), "--body-file", bodyFile]);
+      const prUrl = out.split("\n").pop()?.trim() || "";
+      if (!prUrl) return { status: "error", code: "prCreateFailed", message: "gh pr create produced no PR URL" };
+      return { status: "pr", prUrl };
+    } catch (e) {
+      return { status: "error", code: "prCreateFailed", message: truncate(errText(e), 2000) };
+    }
+  }
+
+  /** Shared rebase step: rebase the job branch onto `onto` in its worktree; null on success, the conflict result otherwise. */
+  async function rebaseBranch(job: JobRecord, onto: string, restoreBranch: () => Promise<void>): Promise<{ status: "conflict"; conflictFiles: string[] } | null> {
+    try {
+      await git(job.worktree_path, ["rebase", onto]);
+      return null;
+    } catch (e) {
+      const conflictFiles = await conflictedFiles(job.worktree_path);
+      await git(job.worktree_path, ["rebase", "--abort"]).catch(() => {});
+      await restoreBranch();
+      // Worktree stays intact — the dispatcher re-dispatches the agent to reconcile; the bridge never retries by itself.
+      store.update(job.task_id, { error: `rebase conflict with ${onto}: ${conflictFiles.join(", ") || truncate(errText(e), 500)}` });
+      return { status: "conflict", conflictFiles };
+    }
+  }
+
+  async function conflictedFiles(dir: string): Promise<string[]> {
+    const { stdout } = await git(dir, ["diff", "--name-only", "--diff-filter=U"]).catch(() => ({ stdout: "", stderr: "" }));
+    return stdout.trim().split("\n").filter(Boolean);
+  }
+
+  /** Map a PR delivery onto the wire shape + job row. On success the branch AND worktree are KEPT — they back the open PR (the sweep cleans up once it closes). */
+  function finishPrDelivery(job: JobRecord, res: PrDeliveryResult): Record<string, unknown> {
+    switch (res.status) {
+      case "pr":
+        store.update(job.task_id, {
+          state: "merged", pr_url: res.prUrl, branch_url: res.prUrl,
+          merged_at: Date.now(), local_only: 0, error: null,
+        });
+        return { merged: true, jobId: job.job_key, deliveredVia: "pr", prUrl: res.prUrl };
+      case "conflict":
+        return { merged: false, conflict: true, conflictFiles: res.conflictFiles };
+      case "error":
+        return { merged: false, error: res.code, message: res.message };
+    }
+  }
+
+  const PR_DIFF_CAP = 48 * 1024;
+
+  /** Fill the repo's PR template by one-shotting the job's OWN provider in the worktree (same plumbing as oneshot plans); null → caller falls back to the structured body. */
+  async function fillPrTemplate(job: JobRecord, template: string, mainBranch: string): Promise<string | null> {
+    const entry = registry.get(job.provider);
+    if (!entry || isStub(entry)) return null;
+    const mode = planModeOf(entry);
+    if (!mode || mode === "interactive") return null; // a TUI can't be one-shotted
+    const { stdout: statOut } = await git(job.worktree_path, ["diff", `${mainBranch}...HEAD`, "--stat"]).catch(() => ({ stdout: "", stderr: "" }));
+    const { stdout: diffOut } = await git(job.worktree_path, ["diff", `${mainBranch}...HEAD`]).catch(() => ({ stdout: "", stderr: "" }));
+    const prompt = [
+      "Fill in this pull-request template for the change described below. Output ONLY the filled template — no preamble, no commentary. Tick checklist items only where truthful; answer every section.",
+      "--- PR TEMPLATE ---", template,
+      "--- TASK BRIEF ---", job.brief,
+      "--- DIFF STAT ---", statOut.trim(),
+      "--- DIFF (may be truncated) ---", truncate(diffOut, PR_DIFF_CAP),
+    ].join("\n\n");
+    try {
+      const res = await runCaptured(entry.command, buildProviderArgs(entry, "plan", prompt, job.worktree_path), {
+        cwd: job.worktree_path, env: { ...process.env, ...entry.env },
+        stdinData: entry.promptVia === "stdin" ? prompt : undefined,
+        timeoutMs: cfg.planTimeoutMs,
+      });
+      if (res.code !== 0) return null;
+      let body = stripAnsi(res.stdout);
+      if (mode === "oneshot" && entry.planOutputFile) {
+        const rel = entry.planOutputFile;
+        const filePath = path.join(job.worktree_path, rel);
+        const fileText = await readFile(filePath, "utf-8").catch(() => "");
+        // Keep the worktree pristine: delete an untracked artifact, restore a tracked one.
+        const { stdout: st } = await git(job.worktree_path, ["status", "--porcelain", "--", rel]).catch(() => ({ stdout: "", stderr: "" }));
+        if (st.startsWith("??")) await rm(filePath, { force: true }).catch(() => {});
+        else if (st.trim()) await git(job.worktree_path, ["checkout", "--", rel]).catch(() => {});
+        if (fileText.trim()) body = fileText;
+      }
+      return body.trim() ? body.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Structured PR body used when there is no template or the one-shot fill failed. */
+  async function fallbackPrBody(job: JobRecord, mainBranch: string): Promise<string> {
+    const { stdout: statOut } = await git(job.worktree_path, ["diff", `${mainBranch}...HEAD`, "--stat"]).catch(() => ({ stdout: "", stderr: "" }));
+    const verifyCmd = await resolveVerifyCommand(job).catch(() => null);
+    const testing = verifyCmd ? `\`${verifyCmd}\` — passed at build time` : "not configured";
+    return `## Summary\n\n${job.brief}\n\n## Changes\n\n\`\`\`\n${statOut.trim()}\n\`\`\`\n\n## Testing\n\n${testing}\n`;
   }
 
   // ── Always-on service machinery ────────────────────────────
@@ -1390,7 +1689,7 @@ export function createBridge(cfg: BridgeConfig) {
     } catch { /* rotation is best-effort */ }
   }
 
-  /** One sweep pass: reattached-pid watch, stale heartbeats, max runtime, revert-window branch cleanup. */
+  /** One sweep pass: reattached-pid watch, stale heartbeats, max runtime, closed-PR branch cleanup. */
   async function sweep(): Promise<void> {
     const now = Date.now();
     // Reattached jobs: pid-alive IS the heartbeat (their stdout pipes died with
@@ -1448,14 +1747,21 @@ export function createBridge(cfg: BridgeConfig) {
         runPlanJob(job.task_id).catch((e: any) => fail(job.task_id, `Internal bridge error on hold retry: ${e.message}`));
       }
     }
-    const cutoff = now - cfg.revertWindowHours * 3600 * 1000;
-    for (const job of store.listMergedForCleanup(cutoff)) {
-      await git(job.repo_path, ["branch", "-D", job.branch]).catch(() => {});
-      if (await hasOrigin(job.repo_path)) {
-        await git(job.repo_path, ["push", "origin", "--delete", job.branch]).catch(() => {});
+    // PR-state poll: pr-delivered branches/worktrees back their PR until it
+    // closes upstream. Merge-mode jobs have nothing left to clean (branch
+    // deleted at merge), and job branches are NEVER deleted on origin — merge
+    // mode never pushed them, and a pr-mode branch belongs to its PR.
+    for (const job of store.listPrDeliveredForCleanup()) {
+      if (!job.pr_url) continue;
+      const prState = await ghPrState(job.repo_path, job.pr_url);
+      if (prState !== "MERGED" && prState !== "CLOSED") continue;
+      if (job.worktree_path) {
+        await git(job.repo_path, ["worktree", "remove", "--force", job.worktree_path]).catch(() => {});
       }
+      await git(job.repo_path, ["branch", "-D", job.branch]).catch(() => {});
       await git(job.repo_path, ["worktree", "prune"]).catch(() => {});
       store.update(job.task_id, { cleaned_at: now });
+      console.error(`[SWEEP] ${job.task_id}: PR ${prState} upstream — local branch and worktree cleaned`);
     }
     await dispatchQueued("sweep");
     updatePower();
