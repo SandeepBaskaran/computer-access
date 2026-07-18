@@ -1,6 +1,6 @@
 {
   "name": "computer-access",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Universal Cross-Platform Local Agent MCP Server + generic coding-agent build bridge",
   "type": "module",
   "main": "dist/server.js",

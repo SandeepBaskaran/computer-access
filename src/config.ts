@@ -129,6 +129,9 @@ export const WORKTREE_ROOT = path.resolve(expandHome(process.env.WORKTREE_ROOT |
 export const MAX_CONCURRENT_JOBS = int(process.env.MAX_CONCURRENT_JOBS, 2);
 export const HEARTBEAT_TIMEOUT_MS = int(process.env.HEARTBEAT_TIMEOUT_MS, 15 * 60 * 1000);
 export const JOB_MAX_RUNTIME_MS = int(process.env.JOB_MAX_RUNTIME_MS, 2 * 60 * 60 * 1000);
+// Bounds `revert` ELIGIBILITY only (time since the merge commit). It no longer
+// implies branch retention: merge-mode branches are deleted at merge, pr-mode
+// branches live until their PR closes.
 export const REVERT_WINDOW_HOURS = int(process.env.REVERT_WINDOW_HOURS, 168);
 export const PLAN_TIMEOUT_MS = int(process.env.PLAN_TIMEOUT_MS, 10 * 60 * 1000);
 export const HOLD_RETRY_MS = int(process.env.HOLD_RETRY_MS, 30 * 60 * 1000);

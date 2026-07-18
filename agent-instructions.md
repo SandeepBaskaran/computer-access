@@ -110,7 +110,7 @@ Full local machine access: filesystem, shell, git, media, documents, and network
 - `get_status` — Durable job state + log excerpt for board comments (includes `awaiting_input`/`paused` details + plan `question`)
 - `answer` — Relay a human's reply into a job paused on `awaiting_input` (live session or clean re-run)
 - `cancel` — Kill a running/planning/held job; worktree removed, branch kept
-- `merge` — Gated `--no-ff` merge of an approved task into main (branch kept for the revert window)
+- `merge` — Gated delivery of an approved task. Ownership decides the mode, not push capability: owned repo → `--no-ff` merge to main (only main pushed, branch deleted); anyone else's repo → rebased branch push + a real PR (`deliveredVia: "pr"`)
 - See **Build Board Workflow** below — these tools are the ONLY way you run board tasks
 
 ---
@@ -126,11 +126,21 @@ The Build Board (a Notion database) is the single control surface for autonomous
 | Draft / Todo | Human | Nothing — the bridge never sees drafts or todos |
 | Planning | Human (wants a plan first) | If no plan job exists: call `plan` with `jobId`, `repoPath`, `prompt`, `agent` — it returns `{started: true}` immediately and runs in the background. If the response is `alreadyPlanning` (or `get_status` says `planning`): skip this run, check next wake. When `get_status` says `planned`: write the `plan` field into the page body (if the card's agent can't plan, the bridge planned via a read-only fallback agent — the plan text says who planned it; the build will still use the card's agent); if `needsInput: true`, also post the `question` for the human. `{error: planUnsupported}` (only when no fallback is configured either) → comment that neither this provider nor a fallback can plan and move the card to Hold — do NOT build instead. `awaiting_input`/`paused` with `quota` → the bridge auto-retries on its own; `session` → owner must re-login. `queued`/`invalidRepo` → same handling as start |
 | Ready for Dev | Human (gate 1) | Call `start` with `jobId` (opaque dedup key — becomes branch job/<jobId>), `repoPath`, `prompt`, the task's `agent`, and `mode` from the card's **Mode** select (`Auto approve` → `"auto"`, `Accept edits` → `"accept_edits"`; omit when unset). In accept_edits, expect `awaiting_input` pauses whenever the CLI wants approval for shell/installs — post the `question`, relay the reply via `answer`. **Check the response before touching the card**: `state: running` → move to In Progress. `alreadyRunning: true` → already dispatched; ensure the card is In Progress, don't re-dispatch. `queued: true` → the job is waiting in the bridge's FIFO queue and dispatches itself when a slot frees — move the card to In Progress. `invalidRepo` → post the exact `reason` as a comment and leave the card — never guess a different path |
-| In Progress | You | Each wake: `get_status`. `in_review` → move to In Review, post `prUrl`/`branchUrl`; if `localOnly: true`, comment "built locally, not pushed (repo has no origin remote)". `failed` → move to Rework (or Failed), post `error` + `logExcerpt`. `awaiting_input`/`paused` → move to Hold and see the hold table below |
-| Hold | Bridge (via job state) | Read the status: `awaiting_input` / `needs_input` → post the `question` as a card comment; when the human replies, call **`answer`** with the reply verbatim — the bridge feeds it into the live CLI session (or cleanly re-runs with the answer folded in) and the loop continues until `planned`/`in_review`. `quota` → do nothing; the bridge auto-retries when the window clears. `session` → tell the owner to re-login to that provider, then re-dispatch. `blocked` → push failed (protected branch / non-fast-forward / auth); post the error; the commit is safe locally (`localOnly: true`) |
+| In Progress | You | Each wake: `get_status`. `in_review` → move to **Ready for Review** and post the `diffStat` as a comment plus "work is kept local (no push, no PR) until Approved" — review happens from the local diff; there is no `prUrl` at this stage. `failed` → post `error` + `logExcerpt` and route the card to the attention bucket (the human decides Rework vs abandon — you never handle a Failed column yourself). `awaiting_input`/`paused` → move to Hold and see the hold table below |
+| Hold | Bridge (via job state) | Read the status: `awaiting_input` / `needs_input` → post the `question` as a card comment; when the human replies, call **`answer`** with the reply verbatim — the bridge feeds it into the live CLI session (or cleanly re-runs with the answer folded in) and the loop continues until `planned`/`in_review`. `quota` → do nothing; the bridge auto-retries when the window clears. `session` → tell the owner to re-login to that provider, then re-dispatch. (Builds never push, so `blocked` push failures no longer occur at build time — delivery problems surface as structured `merge` results, see Approved) |
 | Rework | Human writes new brief | Call `start` again with the same `jobId` and the new prompt — the bridge reuses the same branch and worktree |
-| Approved | Human (gate 2) | Call `merge` with the jobId. `{merged:true}` → move to Merged. `{merged:false, conflict:true}` → move to Rework and post the conflict files |
-| Merged / Failed | You | Terminal. Follow-up work = a new board task |
+| Approved | Human (gate 2) | Call `merge` with the jobId — this is the delivery step, and the bridge resolves the mode itself (**ownership decides, not push capability**). Handle every outcome from the table below |
+| Merged | You | Terminal. Follow-up work = a new board task |
+
+**Approved outcomes (`merge` results):**
+
+| Result | Meaning | Your action |
+|---|---|---|
+| `{merged: true, deliveredVia: "merge", mergeCommit}` | Owned repo: merged `--no-ff` into main, only main pushed, branch already deleted | Move to Merged, post the merge commit |
+| `{merged: true, deliveredVia: "pr", prUrl}` | Someone else's repo: branch rebased + pushed, real PR opened; branch/worktree stay until the PR closes | Move to Merged, post the `prUrl` — upstream review happens on GitHub |
+| `{merged: false, conflict: true, conflictFiles}` | Rebase/merge conflict; worktree intact | Re-dispatch the agent with `start` (same jobId) and a brief telling it to reconcile the listed files — the bridge never retries by itself |
+| `{merged: false, error: "mainDiverged", message}` | Local main and origin main diverged; nothing was changed | Post the exact git error; a human must reconcile main — never force anything |
+| `{merged: false, error: "ghUnauthenticated"}` | PR delivery needs `gh` | Tell the owner to run `gh auth login`, then call `merge` again |
 | (any active state, human asks to stop) | Human | Call `cancel`. The worktree is removed but the branch is KEPT — re-dispatching later resumes from it |
 
 **Rules:**
@@ -138,7 +148,7 @@ The Build Board (a Notion database) is the single control surface for autonomous
 - `alreadyRunning: true` means the task is already dispatched — do not retry, just report status.
 - `queued: true` means the concurrency cap is full — the job waits in the bridge's FIFO queue and starts itself; move the card to In Progress and never re-dispatch it.
 - The two human gates (Ready for Dev, Approved) live on the board. Never call `start` for a Draft, and never call `merge` unless the card is in Approved.
-- `merge` with `action: "revert"` exists but is **not part of your workflow** — it's a manual operator escape hatch used within the revert window. Never call it unless the user explicitly asks.
+- `merge` with `action: "revert"` exists but is **not part of your workflow** — it's a manual operator escape hatch used within the revert window (merge-mode deliveries only; it works from the stored merge commit even though the branch is gone). For pr-mode deliveries it returns a clear error — the PR is reverted upstream. Never call it unless the user explicitly asks.
 - If `merge` returns `confirmationGateActive`, the owner has disabled autonomous merges (break-glass mode). Report it and stop — do not attempt to merge another way.
 - Post `logExcerpt` and `error` from `get_status` as board comments so failures are diagnosable from Notion.
 

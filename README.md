@@ -1,6 +1,6 @@
-# Computer Access MCP v2.0
+# Computer Access MCP v2.1
 
-> **v2.0** — Give cloud AI agents hands on your local machine — hardened, modular, injection-proof — plus an orchestrator for the local coding agents you already use
+> **v2.1.0** — Give cloud AI agents hands on your local machine — hardened, modular, injection-proof — plus an orchestrator for the local coding agents you already use
 
 ---
 
@@ -21,7 +21,7 @@ It is **not** needed by AI tools that already run natively on your machine — *
 ## 🧠 Two roles in one server
 
 1. **Hands** — 19 master tools give a cloud agent direct control of the machine: terminal, filesystem, git, macOS system control, browser automation, media processing, documents, networking. The cloud agent is the brain; these tools are the hands.
-2. **Orchestrator** — the **build bridge** (`plan` / `start` / `get_status` / `answer` / `cancel` / `merge`) turns those local coding agents into dispatchable workers. A cloud agent doesn't have to write code through raw tool calls — it hands the task to Claude Code, Codex, opencode, or any CLI in the registry, and the bridge runs the whole engagement: isolated worktree, build, verify, commit, push, PR, gated merge, revert window.
+2. **Orchestrator** — the **build bridge** (`plan` / `start` / `get_status` / `answer` / `cancel` / `merge`) turns those local coding agents into dispatchable workers. A cloud agent doesn't have to write code through raw tool calls — it hands the task to Claude Code, Codex, opencode, or any CLI in the registry, and the bridge runs the whole engagement: isolated worktree, build, verify, local commit, human-gated delivery (merge to main on owned repos, a real PR on anyone else's), revert window.
 
 **Example — end-to-end development from a task board:** a Notion Custom Agent (mine is named *Dispatcher Assistant*) wakes on a schedule, reads project tasks from the board, plans them (`plan`), dispatches each to the coding agent named on the card (`start`), posts progress and failures back as board comments (`get_status`), and — after a human approves — merges to main (`merge`). One agent in Notion, every coding CLI on your machine, a full development cycle with two human gates and no terminal in sight.
 
@@ -41,7 +41,7 @@ Notion board ──> Dispatcher Assistant (cloud, MCP connector)
 
 ## ✨ Features
 
-- **Build Bridge** — `plan` / `start` / `get_status` / `answer` / `cancel` / `merge`: durable, dispatcher-agnostic coding-agent orchestration (SQLite job store, FIFO queue, isolated git worktrees, question relay, heartbeat crash detection, gated `--no-ff` merges with a revert window)
+- **Build Bridge** — `plan` / `start` / `get_status` / `answer` / `cancel` / `merge`: durable, dispatcher-agnostic coding-agent orchestration (SQLite job store, FIFO queue, isolated git worktrees, question relay, heartbeat crash detection, local-only builds with human-gated delivery: `--no-ff` merges on owned repos, real PRs on anyone else's)
 - **8 Master Tools** — Consolidated tool architecture for deep machine control
 - **Multi-Agent Parallelism** — Session-isolated state allows multiple AI models to work together
 - **19 Master Tools** — Consolidated tool architecture for deep machine control
@@ -128,10 +128,10 @@ Six MCP tools that let any dispatcher (a Notion custom agent, an Obsidian plugin
 |------|-------------|
 | `plan` | Dispatch a READ-ONLY plan job (no branch, no worktree, no writes) and return **immediately** — a slow plan never hangs the caller. Every provider plans in its cheapest viable mode (`planMode` in the registry): **headless** (flags, plan on stdout), **oneshot** (plan captured from a generated file like `plan.md`, artifact cleaned so the repo stays pristine), or **interactive** (the CLI's TUI driven through a pty — mode toggles, slash-commands, the brief). Thin/empty one-shot plans (< `PLAN_MIN_CHARS`) escalate to an interactive session for the same provider, and `complex: true` skips straight there. Plans are jobs in the same store as builds (state `planning` → `planned`, result in `plan`) sharing the concurrency pool, heartbeat/stale-kill, a `PLAN_TIMEOUT_MS` ceiling, and orphan-on-restart recovery. `PLAN_FALLBACK_AGENT` is **last-resort only** — it plans when a provider's mode can't be driven at all (pty failure, unknown flags, no mode), attributed in the plan text; the job's own agent always does the build. `planUnsupported` only when neither the provider nor a valid fallback can plan. |
 | `answer` | Relay a human's reply into a job paused on `awaiting_input`. A live interactive session gets the answer written straight into its pty (the session continues); a dead session (or one lost to a bridge restart, or a headless question) gets the answer folded into the brief and the job cleanly re-runs. Loop until `planned`. |
-| `start` | Dispatch a build: creates branch `job/<jobId>` (or a caller-supplied `branch`) in an isolated worktree under `WORKTREE_ROOT`, runs the agent CLI asynchronously, returns immediately. On success: commit → push → PR via `gh` (compare-URL fallback; `localOnly` when the repo has no `origin`) → `in_review` with a `diffStat`. Structured returns: `alreadyRunning` (idempotent on `jobId`), `queued: true` (capacity full — waits in a durable FIFO queue and starts itself when a slot frees), `invalidRepo` (exact reason, never a guessed path), and `awaiting_input` when the directory has no git repo — the bridge asks permission and `answer("yes")` runs `git init` and continues. Empty diff after a build → `in_review` with an **empty `diffStat`** so the caller sees nothing changed. Re-dispatch of a `failed`/`in_review`/`paused`/`cancelled` job re-runs on the same branch/worktree. |
-| `get_status` | Always an **array**: one job (with log excerpt) or the 50 most recent. Key fields: `state`, `question` (on `awaiting_input`), `pausedReason` (`quota` auto-retries; `session`/`blocked` wait for a human), `prUrl`/`branchUrl`, `localOnly`, `diffStat`, `plan`, `error`, `lastHeartbeat`. |
+| `start` | Dispatch a build: creates branch `job/<jobId>` (or a caller-supplied `branch`) in an isolated worktree under `WORKTREE_ROOT`, runs the agent CLI asynchronously, returns immediately. On success: verify → **local commit only** → `in_review` with a `diffStat`. **Nothing leaves the machine at build time** — no push, no PR (`localOnly: true`); the work is reviewed from the diff and delivered by `merge` after human approval. Structured returns: `alreadyRunning` (idempotent on `jobId`), `queued: true` (capacity full — waits in a durable FIFO queue and starts itself when a slot frees), `invalidRepo` (exact reason, never a guessed path), and `awaiting_input` when the directory has no git repo — the bridge asks permission and `answer("yes")` runs `git init` and continues. Empty diff after a build → `in_review` with an **empty `diffStat`** so the caller sees nothing changed. Re-dispatch of a `failed`/`in_review`/`paused`/`cancelled` job re-runs on the same branch/worktree. |
+| `get_status` | Always an **array**: one job (with log excerpt) or the 50 most recent. Key fields: `state`, `question` (on `awaiting_input`), `pausedReason` (`quota` auto-retries; `session`/`blocked` wait for a human), `deliveryMode` (`merge`/`pr`, resolved at merge time), `prUrl` (pr-mode deliveries), `localOnly`, `diffStat`, `plan`, `error`, `lastHeartbeat`. |
 | `cancel` | Kills a running/held job, removes the worktree, **keeps the branch** — later re-dispatch resumes from it. |
-| `merge` | `--no-ff` merge into main + push. Refuses unless the job is `in_review` and no tracked files have uncommitted changes (untracked junk like `.DS_Store` never blocks). Branch **kept** for `REVERT_WINDOW_HOURS`, worktree removed. Conflicts return `{merged:false, conflict:true}` with the worktree intact. `action:"revert"` reverts a merge within the window (operator use). |
+| `merge` | Deliver an approved (`in_review`) job. **Ownership decides the mode, not push capability** — resolved per repo at merge time (`deliveryMode` in `get_status`): a `.bridge.json` `{"deliver": "merge" \| "pr"}` override wins; else `gh` decides — viewerPermission `ADMIN` or the authenticated `gh` user owning the repo → **merge** mode; `MAINTAIN`/`WRITE`/`TRIAGE`/`READ`/none → **pr** mode (a WRITE collaborator who could technically push still goes through a PR); `gh` missing/unauthenticated or no `origin` → merge mode (local merge, push skipped without origin). **merge mode (owned repo):** sync main (`--ff-only` — a diverged local main returns `{error:"mainDiverged"}`, never guessed), rebase the job branch onto main in the worktree (conflict → `{conflict:true, conflictFiles}` with the worktree intact — the dispatcher re-dispatches the agent to reconcile), `--no-ff` merge, push **only main**, delete the branch + worktree immediately (no retention window). A rejected main-push (protected branch) resets main to `origin/<main>` and falls back **once** to pr mode. **pr mode (anyone else's repo):** local main is never checked out or modified; the job branch is rebased onto `origin/<main>`, pushed (to origin, or to a fork created idempotently via `gh repo fork` when the viewer can't push branches), and a real PR is opened via `gh` with the repo's PR template filled by the job's own provider (structured `Summary/Changes/Testing` fallback) → `{merged:true, deliveredVia:"pr", prUrl}`. Branch + worktree are **kept** while the PR is open; the sweep polls the PR state and cleans up on MERGED/CLOSED. Refuses when tracked files have uncommitted changes (untracked junk like `.DS_Store` never blocks) or `gh` is unauthenticated in pr mode (`ghUnauthenticated`). `action:"revert"` reverts a merge-mode delivery's merge commit within `REVERT_WINDOW_HOURS` (works after branch deletion; operator use) — pr-mode deliveries are reverted upstream. |
 
 ### 🔌 Always-on service (macOS)
 
@@ -156,7 +156,7 @@ npm run build && ./scripts/install-service.sh   # bridge (+ ngrok tunnel service
 
 > **Optional pty upgrade:** interactive/supervised sessions ship on a dependency-free `expect(1)` relay. If you want the more robust native pty, run `npm install node-pty` yourself — the bridge auto-detects and prefers it. The bridge never installs it for you.
 
-**Hold & auto-retry:** provider output is classified on failure — rate-limit/quota → `paused(quota)` and the sweep auto-retries after `HOLD_RETRY_MS`, restoring the previous state; auth/session errors → `paused(session)` (human re-login needed); a trailing question → `awaiting_input` with the question captured; a failed push (protected branch / non-fast-forward / auth) → `paused(blocked)` with the commit kept local and `localOnly:true` — never a silent success.
+**Hold & auto-retry:** provider output is classified on failure — rate-limit/quota → `paused(quota)` and the sweep auto-retries after `HOLD_RETRY_MS`, restoring the previous state; auth/session errors → `paused(session)` (human re-login needed); a trailing question → `awaiting_input` with the question captured. Builds never push, so push failures can only happen at `merge` time — where they surface as structured results (`mainDiverged`, the once-only pr fallback, `ghUnauthenticated`), never a silent success.
 
 **Providers** are data, not code — [providers.json](providers.json) maps an `agent` name to `{command, buildAutoArgs, buildAcceptEditsArgs, planMode, planArgs, resumeArgsTemplate, promptVia}` with `{brief}`/`{workspace}`/`{nudge}` placeholders. Shipped: `claude-code`, `codex`, `opencode`, `antigravity-agy`, `grok-build`, `github-copilot-cli` — each with auto, accept-edits, and plan postures. Adding a provider = one JSON entry (see the `_TODO` notes in the file for what's verified vs. per-spec).
 
@@ -165,6 +165,8 @@ npm run build && ./scripts/install-service.sh   # bridge (+ ngrok tunnel service
 **Crash safety:** heartbeat bumps on every output chunk (stdout *and* stderr); jobs silent past `HEARTBEAT_TIMEOUT_MS` or running past `JOB_MAX_RUNTIME_MS` are killed and marked `failed`; jobs interrupted by a bridge restart are marked `failed` on boot.
 
 **Verification:** `verifyCommand` param > `.bridge.json` `{"verifyCommand": "..."}` in the repo > skip. A failing verify commits the work locally (not pushed) and fails the task for Rework.
+
+**Per-repo config (`.bridge.json` in the repo root):** `{"verifyCommand": "...", "deliver": "merge" | "pr"}` — the optional `deliver` key **overrides** the delivery-mode resolution for that repo: `"merge"` forces a direct main merge, `"pr"` forces PR delivery regardless of ownership.
 
 ---
 
@@ -207,7 +209,7 @@ npm run build && ./scripts/install-service.sh   # bridge (+ ngrok tunnel service
 | `MAX_CONCURRENT_JOBS` | `2` | Parallel job cap; excess dispatches queue FIFO and start themselves |
 | `HEARTBEAT_TIMEOUT_MS` | `900000` | Kill + fail a job with no output for this long (15 min) |
 | `JOB_MAX_RUNTIME_MS` | `7200000` | Hard kill for any job running longer (2 h) |
-| `REVERT_WINDOW_HOURS` | `168` | Merged branches kept this long for revert, then cleaned |
+| `REVERT_WINDOW_HOURS` | `168` | How long after a merge-mode delivery `revert` stays eligible (time since the merge commit). No longer implies branch retention: merge-mode branches are deleted at merge; pr-mode branches live until their PR closes |
 | `PLAN_FALLBACK_AGENT` | `claude-code` | Last-resort planner, used only when a provider's plan mode can't be driven (empty = disable) |
 | `PLAN_MIN_CHARS` | `200` | One-shot plans shorter than this escalate to an interactive session |
 | `PLAN_IDLE_MS` | `20000` | Interactive session idle window before question/completion detection |
@@ -238,7 +240,7 @@ computer-access/
 ├── data/                   # Bridge state: jobs.sqlite + logs/ (gitignored)
 ├── scripts/                # install-service.sh · uninstall-service.sh · buildboard CLI
 ├── service/                # launchd plist templates (bridge + ngrok tunnel)
-├── tests/                  # bridge-smoke.ts (157 assertions) · service-smoke.sh
+├── tests/                  # bridge-smoke.ts (184 assertions) · service-smoke.sh
 └── src/
     ├── start.ts            # Ngrok boot orchestrator (embedded-tunnel mode)
     ├── server.ts           # Composition root: transports (SSE + /mcp), auth, guarded registrar
@@ -257,6 +259,13 @@ computer-access/
 ---
 
 ## 📋 Changelog
+
+### v2.1.0 — 2026-07-18
+**Workflow v2: local-only builds + delivery modes**
+- **Nothing leaves the machine until the human approves**: a finished build is committed locally on its job branch and ends `in_review` with a `diffStat` (`localOnly: true`) — no push, no PR at build time, ever. The build-time `paused(blocked)` push-failure path is gone (builds no longer push)
+- **Delivery happens at `merge` time, and ownership decides the mode — not push capability**: repos the user owns/administers (`gh` viewerPermission `ADMIN` or repo owner) → **merge** mode (sync main `--ff-only`, rebase, `--no-ff` merge, push *only* main, delete the branch immediately); anyone else's repo — even with write/push access — → **pr** mode (rebase on `origin/<main>`, push the *branch* — to origin or an idempotently-created fork — fill the repo's PR template via the job's own provider, open a real PR with `gh`). `.bridge.json` `{"deliver": "merge" | "pr"}` overrides per repo; resolved mode exposed as `deliveryMode` in `get_status`
+- **Main is sacred in both directions**: on owned repos only main is ever pushed (a rejected main-push resets main to `origin/<main>` and falls back once to pr mode); on others' repos local main is never even modified. Diverged local main → `{error: "mainDiverged"}`; rebase conflicts → `{conflict: true, conflictFiles}` with the worktree intact for agent-driven reconciliation; unauthenticated `gh` in pr mode → `{error: "ghUnauthenticated"}`
+- **Branch lifecycle**: merge-mode branches are deleted at merge (no retention window — `REVERT_WINDOW_HOURS` now only bounds `revert` eligibility, and `revert` works from the stored merge commit after deletion); pr-mode branches + worktrees are kept while the PR is open and cleaned by the sweep once `gh pr view` reports MERGED/CLOSED. The sweep never deletes branches on origin
 
 ### v2.0 — 2026-07-06
 **The build bridge (dispatcher-agnostic orchestration):**

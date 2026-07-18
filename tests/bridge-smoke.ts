@@ -82,6 +82,33 @@ const rerunSh = script("rerun.sh", `if [ -f .ran-once ]; then date +%s%N >> prov
 const noopSh = script("noop.sh", `echo "analyzed the repo, nothing to change"`);
 // Fails with a rate-limit message on the first run, succeeds once .quota-marker exists.
 const quotaSh = script("quota.sh", `if [ ! -f .quota-marker ]; then touch .quota-marker; echo "error: 429 rate limit exceeded, try again later" >&2; exit 1; fi\ndate +%s%N >> provider-output.txt\necho "work done after retry"`);
+// Build edits a file; the plan-mode one-shot fills a PR template (delivery-mode pr-body plumbing).
+const prbodySh = script("prbody.sh", `if [ "$1" = "--pr-body" ]; then echo "FILLED TEMPLATE: all sections answered"; exit 0; fi\ndate +%s%N >> provider-output.txt`);
+
+// ── Stub `gh` on PATH: delivery-mode resolution, PR creation, PR-state polls ──
+// Behavior is driven by a mode file: ADMIN | WRITE | READ | UNAUTH | MISSING.
+const ghModeFile = path.join(TMP, "gh-mode");
+const ghCallsLog = path.join(TMP, "gh-calls.log");
+const ghPrStateFile = path.join(TMP, "gh-pr-state");
+const setGhMode = (m: string) => writeFileSync(ghModeFile, m);
+setGhMode("ADMIN");
+process.env.GH_STUB_MODE_FILE = ghModeFile;
+process.env.GH_STUB_LOG = ghCallsLog;
+process.env.GH_STUB_PR_STATE_FILE = ghPrStateFile;
+process.env.GH_STUB_DIR = TMP;
+script("gh", `mode=$(cat "$GH_STUB_MODE_FILE" 2>/dev/null || echo ADMIN)
+echo "$*" >> "$GH_STUB_LOG"
+if [ "$mode" = "MISSING" ]; then echo "gh: command not found" >&2; exit 127; fi
+case "$1 $2" in
+  "auth status") if [ "$mode" = "UNAUTH" ]; then echo "You are not logged into any GitHub hosts." >&2; exit 1; fi ;;
+  "repo view") if [ "$mode" = "UNAUTH" ]; then echo "not logged in" >&2; exit 1; fi; printf '{"viewerPermission":"%s","owner":{"login":"upstream-owner"}}\\n' "$mode" ;;
+  "api user") echo "stub-user" ;;
+  "repo fork") echo "created fork stub-user/repo" ;;
+  "pr create") prev=""; for a in "$@"; do if [ "$prev" = "--body-file" ]; then cp "$a" "$GH_STUB_DIR/last-pr-body.md"; fi; prev="$a"; done; echo "https://github.com/upstream-owner/repo/pull/42" ;;
+  "pr view") printf '{"state":"%s"}\\n' "$(cat "$GH_STUB_PR_STATE_FILE" 2>/dev/null || echo OPEN)" ;;
+esac
+exit 0`);
+process.env.PATH = `${bin}:${process.env.PATH || ""}`;
 
 const registryPath = path.join(TMP, "providers.json");
 writeFileSync(registryPath, JSON.stringify({
@@ -91,6 +118,7 @@ writeFileSync(registryPath, JSON.stringify({
   "stderr":  { command: stderrSh, buildArgs: [], promptVia: "stdin" },
   "noop":    { command: noopSh,   buildArgs: [], promptVia: "stdin" },
   "quota":   { command: quotaSh,  buildArgs: [], promptVia: "stdin" },
+  "prbody":  { command: prbodySh, buildArgs: [], planArgs: ["--pr-body"], planSupported: true, promptVia: "stdin" },
   "planner": { command: planSh,   buildArgs: [], planArgs: ["--plan-mode"], planSupported: true, promptVia: "stdin" },
   "planq":   { command: planqSh,  buildArgs: [], planArgs: ["--plan-mode"], planSupported: true, promptVia: "stdin" },
   "planSlow": { command: silentSh, buildArgs: [], planArgs: ["--plan-mode"], planSupported: true, promptVia: "stdin" },
@@ -154,8 +182,8 @@ async function waitForState(bridge: any, jobId: string, want: string, timeoutMs 
 }
 
 async function main() {
-  // ═══ 1. Happy path: async start → in_review → merge → revert ═══
-  section("1. Happy path (async start, commit, push, --no-ff merge, branch kept, revert)");
+  // ═══ 1. Happy path: async start → LOCAL-ONLY in_review → owned-repo merge → revert ═══
+  section("1. Happy path (local-only build, ownership → merge mode, branch deleted, revert)");
   const bridge = makeBridge("main");
   const repo1 = makeRepo("repo1");
   const t0 = Date.now();
@@ -168,7 +196,9 @@ async function main() {
   assert(s1.state === "in_review", "job reaches in_review", JSON.stringify(s1.error));
   assert(gitOut(repo1, ["log", "job/101", "--oneline"]).includes("job/101: add the feature"), "commit exists on job/101 with job/<id>: <summary> message");
   const bare1 = path.join(TMP, "origins", "repo1.git");
-  assert(gitOut(bare1, ["branch", "--list", "job/101"]).includes("job/101"), "branch pushed to bare origin");
+  assert(!gitOut(bare1, ["branch", "--list", "job/101"]).includes("job/101"), "NO push at build time — origin has no job branch");
+  assert(s1.prUrl === null && s1.branchUrl === null && s1.localOnly === true, "NO PR at build time — in_review is local-only", JSON.stringify({ prUrl: s1.prUrl, branchUrl: s1.branchUrl, localOnly: s1.localOnly }));
+  assert(typeof s1.diffStat === "string" && s1.diffStat.includes("1 file"), "diffStat captured for review from the local diff", s1.diffStat);
   assert(typeof s1.logExcerpt === "string" && s1.logExcerpt.includes("work done"), "getJobStatus returns log excerpt");
 
   // merge refusal on dirty tree — TRACKED modifications block…
@@ -186,19 +216,23 @@ async function main() {
 
   const m1 = await bridge.mergeTask("101");
   assert(m1.merged === true && !!m1.mergeCommit, "merge succeeds despite untracked .DS_Store present", JSON.stringify(m1));
+  assert(m1.deliveredVia === "merge", "stub gh reports ADMIN → owned repo → merge mode", JSON.stringify(m1));
   const parents = gitOut(repo1, ["rev-list", "--parents", "-n", "1", m1.mergeCommit]).split(" ");
   assert(parents.length === 3, "--no-ff produced a real merge commit (2 parents)");
   assert(gitOut(bare1, ["rev-parse", "main"]) === m1.mergeCommit, "main pushed to origin");
-  assert(gitOut(repo1, ["branch", "--list", "job/101"]).includes("job/101"), "branch KEPT after merge");
+  assert(!gitOut(bare1, ["branch", "--list", "job/101"]).includes("job/101"), "ONLY main pushed — origin never sees the job branch");
+  assert(!gitOut(repo1, ["branch", "--list", "job/101"]).includes("job/101"), "branch DELETED immediately at merge — no retention window");
   assert(!existsSync(r1.worktree), "worktree removed at merge");
+  const s1Merged = await bridge.getJobStatus("101");
+  assert(s1Merged.deliveryMode === "merge", "resolved deliveryMode exposed in get_status", s1Merged.deliveryMode);
 
   // double-merge refused
   const m1b = await bridge.mergeTask("101");
   assert(m1b.merged === false && m1b.error === "invalidState", "second merge refused (state=merged)");
 
-  // revert within window
+  // revert within window — works from the stored merge_commit AFTER branch deletion
   const rv = await bridge.mergeTask("101", "revert");
-  assert(rv.reverted === true, "revert succeeds within window", JSON.stringify(rv));
+  assert(rv.reverted === true, "revert succeeds within window despite the branch being gone (operates on merge_commit)", JSON.stringify(rv));
   assert(gitOut(repo1, ["log", "-1", "--format=%s", "main"]).startsWith("Revert"), "main HEAD is the revert commit");
   const rvAgain = await bridge.mergeTask("101", "revert");
   assert(rvAgain.merged === false && rvAgain.error === "invalidState", "second revert refused (state=reverted)");
@@ -295,22 +329,47 @@ async function main() {
   const s9 = await waitForTerminal(bridge, "501");
   assert(s9.state === "in_review" && s9.localOnly === true && s9.error === null, "no origin → in_review with localOnly:true, no push error", JSON.stringify({ state: s9.state, localOnly: s9.localOnly, error: s9.error }));
 
-  // ═══ 8. Merge conflict path ═══
-  section("8. Merge conflict");
+  // ═══ 8. Rebase conflict against a moved origin/main ═══
+  section("8. Rebase conflict (origin/main moved, branch conflicts)");
   const repo10 = makeRepo("repo10");
   const rc = await bridge.startTask({ jobId: "601", repoPath: repo10, prompt: "conflicting work" });
   const sc = await waitForTerminal(bridge, "601");
   assert(sc.state === "in_review", "conflict fixture reaches in_review first", sc.error ?? sc.state);
-  // Diverge main: same file, different content → add/add conflict
+  // Move origin/main with content that conflicts with the branch (same file, different content)
   writeFileSync(path.join(repo10, "provider-output.txt"), "conflicting main content\n");
   sh(repo10, "git", ["add", "-A"]); sh(repo10, "git", ["commit", "-m", "diverge main"]);
+  sh(repo10, "git", ["push", "origin", "main"]);
+  sh(repo10, "git", ["reset", "--hard", "HEAD~1"]); // local main behind; origin/main moved ahead
   const mc = await bridge.mergeTask("601");
-  assert(mc.merged === false && mc.conflict === true, "merge conflict detected, not merged", JSON.stringify(mc));
+  assert(mc.merged === false && mc.conflict === true, "rebase onto the synced main conflicts — not merged", JSON.stringify(mc));
   assert(Array.isArray(mc.conflictFiles) && mc.conflictFiles.includes("provider-output.txt"), "conflict files reported", JSON.stringify(mc.conflictFiles));
-  assert(existsSync(rc.worktree), "worktree kept intact on conflict (Rework can continue)");
-  assert(gitOut(repo10, ["status", "--porcelain"]) === "", "repo left clean after aborted merge");
+  const bare10 = path.join(TMP, "origins", "repo10.git");
+  assert(gitOut(repo10, ["rev-parse", "main"]) === gitOut(bare10, ["rev-parse", "main"]), "local main was --ff-only synced to the moved origin/main before the rebase");
+  assert(existsSync(rc.worktree), "worktree kept intact on conflict (the dispatcher re-dispatches the agent to reconcile)");
+  assert(gitOut(repo10, ["status", "--porcelain"]) === "", "repo left clean after aborted rebase");
   const scAfter = await bridge.getJobStatus("601");
   assert(scAfter.state === "in_review" && (scAfter.error ?? "").includes("conflict"), "job stays in_review with conflict noted", JSON.stringify({ state: scAfter.state, error: scAfter.error }));
+
+  // ═══ 8b. Diverged local main → mainDiverged, never guess, never force ═══
+  section("8b. Diverged local main");
+  const repoDiv = makeRepo("repoDiv");
+  await bridge.startTask({ jobId: "602", repoPath: repoDiv, prompt: "diverge fixture" });
+  const sDiv = await waitForTerminal(bridge, "602");
+  assert(sDiv.state === "in_review", "diverge fixture builds", sDiv.error ?? sDiv.state);
+  // origin/main moves via a second clone…
+  const divClone = path.join(TMP, "repos", "repoDiv-clone");
+  sh(TMP, "git", ["clone", path.join(TMP, "origins", "repoDiv.git"), divClone]);
+  sh(divClone, "git", ["config", "user.email", "smoke@test.local"]);
+  sh(divClone, "git", ["config", "user.name", "Bridge Smoke"]);
+  writeFileSync(path.join(divClone, "upstream.txt"), "upstream change\n");
+  sh(divClone, "git", ["add", "-A"]); sh(divClone, "git", ["commit", "-m", "upstream moves"]); sh(divClone, "git", ["push", "origin", "main"]);
+  // …while local main commits something different
+  writeFileSync(path.join(repoDiv, "local.txt"), "local change\n");
+  sh(repoDiv, "git", ["add", "-A"]); sh(repoDiv, "git", ["commit", "-m", "local diverges"]);
+  const mDiv = await bridge.mergeTask("602");
+  assert(mDiv.merged === false && mDiv.error === "mainDiverged", "diverged local main → { error: mainDiverged }", JSON.stringify(mDiv));
+  assert(typeof mDiv.message === "string" && mDiv.message.length > 0, "exact git error surfaced in message", mDiv.message);
+  assert((await bridge.getJobStatus("602")).state === "in_review", "job untouched by mainDiverged — still in_review");
 
   // ═══ 9. Confirmation gate (break-glass) ═══
   section("9. Break-glass confirmation gate");
@@ -324,7 +383,7 @@ async function main() {
   const storeA = new JobStore(restartDb);
   const baseRow = {
     repo_path: repo1, provider: "ok", brief: "interrupted", verify_command: null,
-    pr_url: null, branch_url: null, merge_commit: null, error: null, local_only: null, plan: null, plan_provider: null, plan_complex: null, session_id: null, mode: null, pending_action: null, diff_stat: null,
+    pr_url: null, branch_url: null, merge_commit: null, error: null, local_only: null, plan: null, plan_provider: null, plan_complex: null, session_id: null, mode: null, pending_action: null, diff_stat: null, delivery_mode: null,
     hold_reason: null, prev_state: null, question: null, hold_since: null,
     pid: null, last_heartbeat: Date.now(), started_at: Date.now(), finished_at: null, merged_at: null, cleaned_at: null,
   };
@@ -339,19 +398,52 @@ async function main() {
   assert(j702?.state === "failed", "orphaned PLANNING job also marked failed on boot", j702?.state);
   storeB.close();
 
-  // ═══ 11. Revert-window cleanup sweep ═══
-  section("11. Revert-window branch cleanup");
-  const zeroWindow = makeBridge("zerowin", { revertWindowHours: 0 });
+  // ═══ 11. Delivery mode "pr": non-owned repo → branch push + real PR ═══
+  section("11. pr mode (WRITE collaborator — ownership decides, not push capability)");
   const repo11 = makeRepo("repo11");
-  await zeroWindow.startTask({ jobId: "801", repoPath: repo11, prompt: "merge and clean" });
-  await waitForTerminal(zeroWindow, "801");
-  const m801 = await zeroWindow.mergeTask("801");
-  assert(m801.merged === true, "cleanup fixture merged", JSON.stringify(m801));
-  await sleep(50);
-  await zeroWindow.sweep();
-  assert(!gitOut(repo11, ["branch", "--list", "job/801"]).includes("job/801"), "expired branch deleted locally by sweep");
+  sh(repo11, "git", ["checkout", "-b", "parked"]); // prove pr mode never touches local main/HEAD
+  const mainShaBefore = gitOut(repo11, ["rev-parse", "main"]);
+  await bridge.startTask({ jobId: "801", repoPath: repo11, prompt: "work for a PR" });
+  const s801 = await waitForTerminal(bridge, "801");
+  assert(s801.state === "in_review", "pr fixture builds to in_review", s801.error ?? s801.state);
+  setGhMode("WRITE");
+  const m801 = await bridge.mergeTask("801");
+  setGhMode("ADMIN");
+  assert(m801.merged === true && m801.deliveredVia === "pr", "WRITE collaborator → pr mode even though a push would succeed", JSON.stringify(m801));
+  assert((m801.prUrl ?? "").includes("/pull/42"), "real PR URL returned", m801.prUrl);
   const bare11 = path.join(TMP, "origins", "repo11.git");
-  assert(!gitOut(bare11, ["branch", "--list", "job/801"]).includes("job/801"), "expired branch deleted on origin by sweep");
+  assert(gitOut(bare11, ["branch", "--list", "job/801"]).includes("job/801"), "job BRANCH pushed to origin");
+  assert(gitOut(bare11, ["rev-parse", "main"]) === mainShaBefore, "origin main untouched by pr delivery — never pushed");
+  assert(gitOut(repo11, ["rev-parse", "main"]) === mainShaBefore && gitOut(repo11, ["rev-parse", "--abbrev-ref", "HEAD"]) === "parked", "local main never written, HEAD never moved (pr mode)");
+  assert(readFileSync(ghCallsLog, "utf-8").includes("pr create"), "gh pr create was called");
+  assert(readFileSync(path.join(TMP, "last-pr-body.md"), "utf-8").includes("## Summary"), "no template → structured fallback body (## Summary/Changes/Testing)");
+  const s801Merged = await bridge.getJobStatus("801");
+  assert(s801Merged.state === "merged" && s801Merged.deliveryMode === "pr" && (s801Merged.prUrl ?? "").includes("/pull/42"), "job merged with deliveryMode=pr and pr_url stored", JSON.stringify({ state: s801Merged.state, deliveryMode: s801Merged.deliveryMode, prUrl: s801Merged.prUrl }));
+  assert(gitOut(repo11, ["branch", "--list", "job/801"]).includes("job/801") && existsSync(s801Merged.worktree), "branch AND worktree KEPT while the PR is open");
+  // revert on a pr-mode delivery → clear error
+  const rv801 = await bridge.mergeTask("801", "revert");
+  assert(rv801.merged === false && rv801.error === "prDelivery" && (rv801.message ?? "").includes("upstream"), "revert on a pr-mode job → clear 'revert the PR upstream' error", JSON.stringify(rv801));
+  // sweep poll: PR reports MERGED upstream → local branch + worktree cleaned; remote branch untouched
+  writeFileSync(ghPrStateFile, "MERGED");
+  await bridge.sweep();
+  writeFileSync(ghPrStateFile, "OPEN");
+  assert(!existsSync(s801Merged.worktree) && !gitOut(repo11, ["branch", "--list", "job/801"]).includes("job/801"), "PR closed upstream → sweep cleaned local branch + worktree");
+  assert(gitOut(bare11, ["branch", "--list", "job/801"]).includes("job/801"), "sweep NEVER deletes branches on origin (no push origin --delete)");
+
+  // ═══ 11b. PR template → body filled by the job's own provider one-shot ═══
+  section("11b. PR template filled by the provider");
+  const repo11b = makeRepo("repo11b");
+  mkdirSync(path.join(repo11b, ".github"), { recursive: true });
+  writeFileSync(path.join(repo11b, ".github", "PULL_REQUEST_TEMPLATE.md"), "## Why\n\n## Checklist\n- [ ] tests\n");
+  sh(repo11b, "git", ["add", "-A"]); sh(repo11b, "git", ["commit", "-m", "add PR template"]); sh(repo11b, "git", ["push", "origin", "main"]);
+  await bridge.startTask({ jobId: "802", repoPath: repo11b, prompt: "templated pr", agent: "prbody" });
+  const s802 = await waitForTerminal(bridge, "802");
+  assert(s802.state === "in_review", "template fixture builds", s802.error ?? s802.state);
+  setGhMode("WRITE");
+  const m802 = await bridge.mergeTask("802");
+  setGhMode("ADMIN");
+  assert(m802.merged === true && m802.deliveredVia === "pr", "template fixture delivered via pr", JSON.stringify(m802));
+  assert(readFileSync(path.join(TMP, "last-pr-body.md"), "utf-8").includes("FILLED TEMPLATE"), "PR body produced by the provider one-shot from the discovered template");
 
   // ═══ 12. invalidRepo: exact reasons, never guessed paths ═══
   section("12. invalidRepo validation");
@@ -535,16 +627,34 @@ async function main() {
   assert(sResumed.state === "in_review", "auto-retry restored prevState and the retry succeeded → in_review", JSON.stringify({ state: sResumed.state, error: sResumed.error }));
   assert(sResumed.pausedReason === null && sResumed.question === null, "hold fields cleared after resume");
 
-  // ═══ 16. Push failure → hold(blocked), commit kept local, localOnly ═══
-  section("16. Push failure → hold(blocked)");
+  // ═══ 16. Protected main on an "owned" repo → merge-mode push rejected → one-shot pr fallback ═══
+  section("16. Rejected main push → automatic fallback to pr mode");
   const repo14 = makeRepo("repo14");
-  sh(repo14, "git", ["remote", "set-url", "origin", path.join(TMP, "origins", "gone.git")]);
-  await bridge.startTask({ jobId: "1301", repoPath: repo14, prompt: "push will fail" });
-  const sPush = await waitForTerminal(bridge, "1301");
-  assert(sPush.state === "paused" && sPush.pausedReason === "blocked", "failed push → paused(blocked), never silent success", JSON.stringify({ state: sPush.state, pausedReason: sPush.pausedReason }));
-  assert(sPush.localOnly === true, "commit flagged localOnly");
-  assert((sPush.error ?? "").includes("Push of job/1301 failed"), "push error surfaced verbatim", sPush.error);
-  assert(gitOut(repo14, ["rev-list", "--count", "main..job/1301"]) !== "0", "commit kept local on the task branch");
+  const bare14 = path.join(TMP, "origins", "repo14.git");
+  const hookPath = path.join(bare14, "hooks", "pre-receive");
+  writeFileSync(hookPath, `#!/bin/bash\nwhile read old new ref; do\n  if [ "$ref" = "refs/heads/main" ]; then echo "protected: main" >&2; exit 1; fi\ndone\nexit 0\n`);
+  chmodSync(hookPath, 0o755);
+  await bridge.startTask({ jobId: "1301", repoPath: repo14, prompt: "will hit the protected branch" });
+  const sProt = await waitForTerminal(bridge, "1301");
+  assert(sProt.state === "in_review", "protected-branch fixture builds", sProt.error ?? sProt.state);
+  const mProt = await bridge.mergeTask("1301"); // gh mode ADMIN → merge mode is attempted first
+  assert(mProt.merged === true && mProt.deliveredVia === "pr", "rejected main push → fell back ONCE to pr delivery", JSON.stringify(mProt));
+  assert(gitOut(repo14, ["rev-parse", "main"]) === gitOut(bare14, ["rev-parse", "main"]), "local main reset to origin/main — the unpushable merge commit does not linger");
+  assert(gitOut(bare14, ["branch", "--list", "job/1301"]).includes("job/1301"), "job branch pushed for the fallback PR");
+  assert((await bridge.getJobStatus("1301")).deliveryMode === "pr", "fallback recorded as deliveryMode=pr");
+
+  // Unauthenticated gh where pr delivery is required → structured error, job still deliverable later
+  const repo14b = makeRepo("repo14b");
+  writeFileSync(path.join(repo14b, ".bridge.json"), JSON.stringify({ deliver: "pr" }));
+  sh(repo14b, "git", ["add", "-A"]); sh(repo14b, "git", ["commit", "-m", "force pr delivery"]); sh(repo14b, "git", ["push", "origin", "main"]);
+  await bridge.startTask({ jobId: "1302", repoPath: repo14b, prompt: "pr without gh" });
+  const sUn = await waitForTerminal(bridge, "1302");
+  assert(sUn.state === "in_review", "unauth fixture builds", sUn.error ?? sUn.state);
+  setGhMode("UNAUTH");
+  const mUn = await bridge.mergeTask("1302");
+  setGhMode("ADMIN");
+  assert(mUn.merged === false && mUn.error === "ghUnauthenticated" && (mUn.message ?? "").includes("gh auth login"), "unauthenticated gh in pr mode → { error: ghUnauthenticated }", JSON.stringify(mUn));
+  assert((await bridge.getJobStatus("1302")).state === "in_review", "job stays in_review — deliverable once gh is authenticated");
 
   // ═══ 17. cancel-task: kill, remove worktree, KEEP branch ═══
   section("17. cancel-task");
@@ -614,7 +724,7 @@ async function main() {
   process.kill(alivePid!, "SIGTERM");
   await sleep(400); await rb2.sweep(); // pid gone → finish the pipeline
   const finished = await waitForState(rb2, "3201", "in_review");
-  assert(finished.state === "in_review", "reattached job finished verify→commit→push after its process exited", finished.error ?? finished.state);
+  assert(finished.state === "in_review", "reattached job finished verify→commit (local-only) after its process exited", finished.error ?? finished.state);
   rb2.close();
   // (ii) dead job WITH resumeArgsTemplate → resumed in the same worktree
   const repoRec2 = makeRepo("repoRec2");
@@ -712,7 +822,7 @@ async function main() {
 
   // ── Summary ──
   console.log(`\n${"═".repeat(50)}\n${failed === 0 ? "✅ ALL PASSED" : "❌ FAILURES"}: ${passed} passed, ${failed} failed`);
-  bridge.close(); fastBridge.close(); capBridge.close(); gatedBridge.close(); zeroWindow.close(); deniedBridge.close(); fbBridge.close(); fbBadBridge.close(); pwrBridge.close();
+  bridge.close(); fastBridge.close(); capBridge.close(); gatedBridge.close(); deniedBridge.close(); fbBridge.close(); fbBadBridge.close(); pwrBridge.close();
   process.exit(failed === 0 ? 0 : 1);
 }
 
